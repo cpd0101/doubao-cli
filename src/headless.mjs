@@ -79,33 +79,88 @@ async function signedInClient(timeoutMs, profile) {
   return client;
 }
 
-export async function streamCompletion(client, body, { timeoutMs, waitForReply = false, onReceipt = () => {}, runId = '', signal } = {}) {
+export async function streamCompletion(client, body, {
+  timeoutMs, waitForReply = false, onReceipt = () => {}, runId = '', signal,
+  // Desktop/CDP stops the spinner when Frontier agent_task_status settles.
+  agentStatus = null,
+} = {}) {
   const state = { conversationId: body.client_meta.conversation_id, runId, localMessageId: body.messages[0].local_message_id,
-    answer: '', thinking: '', completed: false, handoffs: [], liveMessages: [], requestBody: body, accepted: false, requestDispatched: false };
+    answer: '', thinking: '', completed: false, handoffs: [], liveMessages: [], requestBody: body, accepted: false, requestDispatched: false,
+    earlyComplete: null };
   const checkpoint = () => onReceipt({ ...state });
   try {
     state.requestDispatched = true;
     const response = await client.request('/chat/completion', { method: 'POST', timeoutMs, ...(signal ? { signal } : {}),
       headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-    await consumeSse(response, async (event, data) => {
-      if (event === 'SSE_ACK') {
-        const id = String(data?.ack_client_meta?.conversation_id || '');
-        const acceptedRun = String(data?.query_list?.[0]?.question_id || '');
-        const acceptedLocalId = data?.query_list?.[0]?.local_message_id;
-        if (!ID.test(id) || !ID.test(acceptedRun) || state.conversationId && id !== state.conversationId
-          || acceptedLocalId && acceptedLocalId !== state.localMessageId
-          || runId && runId !== acceptedRun) throw new Error('Doubao returned a mismatched acceptance receipt');
-        state.accepted = true;
+    const streamStarted = Date.now();
+    const timing = process.env.DOUBAO_HEADLESS_TIMING === '1';
+    let firstAnswerAt = 0;
+    let earlyWatcher = null;
+    const earlyAbort = new AbortController();
+    const stopEarly = async (reason) => {
+      if (state.earlyComplete) return;
+      state.earlyComplete = reason || 'agent_task_status';
+      state.completed = true;
+      if (timing) console.error(`[headless-timing] completion_early_complete +${Date.now() - streamStarted}ms reason=${state.earlyComplete}`);
+      try { await response.body?.cancel?.(); } catch {}
+    };
+    const linkSignals = (...signals) => {
+      const active = signals.filter(Boolean);
+      if (!active.length) return undefined;
+      if (typeof AbortSignal.any === 'function') return AbortSignal.any(active);
+      const merged = new AbortController();
+      for (const item of active) {
+        if (item.aborted) { merged.abort(item.reason); break; }
+        item.addEventListener('abort', () => merged.abort(item.reason), { once: true });
       }
-      // A Work ACK can precede provisioning its asynchronous task. Keep the
-      // initial stream until a handoff or terminal event even without --wait.
-      const result = reduceStreamEvent(state, event, data, { waitForReply: waitForReply || body.option.agent_mode === 1 });
-      const pending = updateLiveControls(state, event, data);
-      if (event === 'SSE_ACK' || event === 'FETCH_STREAM' || pending) checkpoint();
-      if (event === 'STREAM_ERROR' || event === 'gateway-error') throw Object.assign(new Error('Doubao completion failed'), { code: 'stream_error' });
-      if (event === 'SSE_ACK' && body.option.general_task_param.runtime_type === 2 && !waitForReply) return 'stop';
-      return result || (pending || state.accepted && state.handoffs.length ? 'stop' : undefined);
-    });
+      return merged.signal;
+    };
+    try {
+      await consumeSse(response, async (event, data) => {
+        if (state.earlyComplete) return 'stop';
+        if (event === 'SSE_ACK') {
+          const id = String(data?.ack_client_meta?.conversation_id || '');
+          const acceptedRun = String(data?.query_list?.[0]?.question_id || '');
+          const acceptedLocalId = data?.query_list?.[0]?.local_message_id;
+          if (!ID.test(id) || !ID.test(acceptedRun) || state.conversationId && id !== state.conversationId
+            || acceptedLocalId && acceptedLocalId !== state.localMessageId
+            || runId && runId !== acceptedRun) throw new Error('Doubao returned a mismatched acceptance receipt');
+          state.accepted = true;
+          state.conversationId = id;
+          if (timing) console.error(`[headless-timing] completion_ack +${Date.now() - streamStarted}ms`);
+          if (!earlyWatcher && agentStatus && typeof agentStatus.waitUntilSettled === 'function' && waitForReply) {
+            earlyWatcher = agentStatus.waitUntilSettled(id, {
+              signal: linkSignals(signal, earlyAbort.signal),
+              timeoutMs: Math.max(1, timeoutMs - (Date.now() - streamStarted)),
+            }).then((result) => stopEarly(result?.reason || 'agent_task_status')).catch(() => {});
+          }
+        }
+        if (timing && event === 'FETCH_STREAM') {
+          console.error(`[headless-timing] completion_fetch_stream +${Date.now() - streamStarted}ms type=${data?.fetch_type} key=${data?.fetch_key || ''}`);
+        }
+        if (timing && event === 'SSE_REPLY_END') {
+          console.error(`[headless-timing] completion_reply_end +${Date.now() - streamStarted}ms end_type=${data?.end_type} brief=${JSON.stringify(String(data?.msg_finish_attr?.brief || '').slice(0, 40))}`);
+        }
+        // A Work ACK can precede provisioning its asynchronous task. Keep the
+        // initial stream until a handoff or terminal event even without --wait.
+        const beforeAnswer = state.answer;
+        const result = reduceStreamEvent(state, event, data, { waitForReply: waitForReply || body.option.agent_mode === 1 });
+        if (timing && !firstAnswerAt && state.answer && state.answer !== beforeAnswer) {
+          firstAnswerAt = Date.now();
+          console.error(`[headless-timing] completion_first_answer +${firstAnswerAt - streamStarted}ms text=${JSON.stringify(state.answer.slice(0, 40))}`);
+        }
+        const pending = updateLiveControls(state, event, data);
+        if (event === 'SSE_ACK' || event === 'FETCH_STREAM' || pending) checkpoint();
+        if (event === 'STREAM_ERROR' || event === 'gateway-error') throw Object.assign(new Error('Doubao completion failed'), { code: 'stream_error' });
+        if (event === 'SSE_ACK' && body.option.general_task_param.runtime_type === 2 && !waitForReply) return 'stop';
+        if (state.earlyComplete) return 'stop';
+        return result || (pending || state.accepted && state.handoffs.length ? 'stop' : undefined);
+      });
+    } finally {
+      earlyAbort.abort();
+      await earlyWatcher;
+    }
+    if (timing) console.error(`[headless-timing] completion_stream_done +${Date.now() - streamStarted}ms answer=${JSON.stringify(state.answer.slice(0, 40))} handoffs=${state.handoffs.length} completed=${state.completed} early=${state.earlyComplete || ''}`);
     if (!state.accepted) throw new Error('Completion ended without a verified acceptance receipt');
     checkpoint();
     return state;
@@ -396,7 +451,8 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
       catch (error) { throw acceptedLocalFailure(error, accepted); }
       return accepted;
     }
-    let localTaskParam, localRuntime, connectors, enginePromise, localChannel, localChannelAbort;
+    let localTaskParam, localRuntime, connectors, enginePromise, localChannel, localChannelAbort, frontierSocket, frontierAgentStatus;
+    const localTransport = process.env.DOUBAO_HEADLESS_LOCAL_TRANSPORT === 'frontier-ws' ? 'frontier-ws' : 'http-sse';
     try {
       if (runtimeChoice === 'local') {
         const localProject = taskContext.projectContext;
@@ -433,21 +489,41 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
       // miss the initial workspace command on a device without a native app.
       if (localRuntime) {
         localChannelAbort = new AbortController();
-        // Some servers flush SSE headers only after the first task command.
-        // Dispatch the subscription first, but await it after acceptance.
-        localChannel = prepareHeadlessLocalChannel(client, {
-          sandboxId: localRuntime.sandboxId, deviceId: localRuntime.deviceId, timeoutMs: remaining(), signal: localChannelAbort.signal,
-        });
-        localChannel.catch(() => {});
+        if (localTransport === 'frontier-ws') {
+          const { connectFrontierCommandChannel } = await import('./headless-frontier-ws.mjs');
+          const channel = await connectFrontierCommandChannel(client, {
+            deviceId: localRuntime.deviceId, timeoutMs: Math.min(15_000, remaining()),
+          });
+          frontierSocket = channel.socket;
+          frontierAgentStatus = channel.agentStatus;
+        } else {
+          // Frontier probes may have registered enable_ws_multi_env=1 for this device;
+          // that routes commands away from legacy SSE. Clear before subscribing.
+          const { clearMultiEnvDevice } = await import('./headless-frontier-ws.mjs');
+          await clearMultiEnvDevice(client, { timeoutMs: Math.min(15_000, remaining()) }).catch(() => {});
+          // Some servers flush SSE headers only after the first task command.
+          // Dispatch the subscription first, but await it after acceptance.
+          localChannel = prepareHeadlessLocalChannel(client, {
+            sandboxId: localRuntime.sandboxId, deviceId: localRuntime.deviceId, timeoutMs: remaining(), signal: localChannelAbort.signal,
+          });
+          localChannel.catch(() => {});
+        }
       }
       let receipt = { requestBody: body, mode, ...(localRuntime ? { localRuntime } : {}) };
       let reportedAcceptance = false;
+      const startEngine = (initialResponse) => startLocalRuntime(client, profile, receipt, connectors, remaining(), initialResponse, localChannelAbort?.signal, {
+        autoApprove: options.yes === true, transport: localTransport, frontierSocket,
+      });
       const checkpoint = next => {
         Object.assign(receipt, next); store.save(receipt);
         if (localRuntime && options.wait && receipt.accepted && receipt.conversationId && !enginePromise) {
-          const initialResponse = localChannel;
-          localChannel = null;
-          enginePromise = initialResponse.then(response => startLocalRuntime(client, profile, receipt, connectors, remaining(), response, localChannelAbort?.signal, { autoApprove: options.yes === true }));
+          if (localTransport === 'frontier-ws') {
+            enginePromise = startEngine(undefined);
+          } else {
+            const initialResponse = localChannel;
+            localChannel = null;
+            enginePromise = initialResponse.then(response => startEngine(response));
+          }
           enginePromise.catch(() => {});
         }
         if (receipt.accepted && !reportedAcceptance && options.onAccepted) {
@@ -457,8 +533,12 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
         }
       };
       let accepted, submissionError;
-      try { accepted = await streamCompletion(client, body, { timeoutMs: remaining(), waitForReply: options.wait, onReceipt: checkpoint }); }
-      catch (error) {
+      try {
+        accepted = await streamCompletion(client, body, {
+          timeoutMs: remaining(), waitForReply: options.wait, onReceipt: checkpoint,
+          agentStatus: localTransport === 'frontier-ws' && options.wait ? frontierAgentStatus : null,
+        });
+      } catch (error) {
         submissionError = error;
         if (error.result?.accepted && receipt.conversationId && receipt.runId) {
           const recoveryReceiptPath = store.filePath(receipt.conversationId, receipt.runId);
@@ -503,10 +583,35 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
           localMessageId: receipt.localMessageId, status: 'running', accepted: true, reply: null };
       }
       try {
+        // Align with Desktop/CDP: once Frontier clears agent_task_status, stop waiting on
+        // the late HTTP completion end_type=3 and return the visible reply from IM.
+        if (accepted.earlyComplete === 'agent_task_status' && receipt.conversationId && receipt.runId) {
+          if (localRuntime) enginePromise ||= startEngine(undefined);
+          if (enginePromise) await enginePromise.catch(() => null);
+          let text = String(accepted.answer || '').trim();
+          for (let attempt = 0; !text && attempt < 8; attempt += 1) {
+            if (attempt) await new Promise(resolve => setTimeout(resolve, 150));
+            const snapshot = await readTurn(client, receipt.conversationId, {
+              runId: receipt.runId, receipt, deadline,
+            }).catch(() => null);
+            text = String(snapshot?.result?.reply?.text || snapshot?.result?.progress || '').trim();
+          }
+          if (text) {
+            return {
+              platform: 'headless', mode, ...(goalId ? { goalId } : {}),
+              context: { runtime: runtimeChoice, ...(localRuntime ? { workspace: localRuntime.workspace } : {}),
+                projectId: taskContext.projectId || null, enterpriseKnowledge: Boolean(taskContext.enterpriseSkill) },
+              accepted: true,
+              conversationId: receipt.conversationId, runId: receipt.runId, localMessageId: receipt.localMessageId,
+              status: 'completed', reply: { role: 'assistant', text },
+              completion: 'agent_task_status',
+            };
+          }
+        }
         const wait = signal => waitTurn(client, receipt.conversationId, { runId: receipt.runId, receipt, deadline, signal,
           onReceipt: checkpoint, loadReceipt: run => store.read(receipt.conversationId, run) });
         const result = localRuntime ? await waitWithLocalRuntime(wait,
-          () => enginePromise ||= startLocalRuntime(client, profile, receipt, connectors, remaining(), undefined, localChannelAbort?.signal, { autoApprove: options.yes === true }),
+          () => enginePromise ||= startEngine(undefined),
           { abortStartup: () => localChannelAbort?.abort() }) : await wait();
         return { platform: 'headless', mode, ...(goalId ? { goalId } : {}), context: { runtime: runtimeChoice, ...(localRuntime ? { workspace: localRuntime.workspace } : {}),
           projectId: taskContext.projectId || null, enterpriseKnowledge: Boolean(taskContext.enterpriseSkill) }, accepted: true, ...result };
@@ -514,6 +619,8 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
     } finally {
       localChannelAbort?.abort();
       await localChannel?.then(response => response.body?.cancel()).catch(() => {});
+      try { frontierAgentStatus?.detach?.(); } catch {}
+      try { frontierSocket?.close?.(); } catch {}
       if (enginePromise) { const engine = await enginePromise.catch(() => null); await engine?.close(); }
       await connectors?.close();
     }
@@ -548,7 +655,9 @@ function acceptedLocalFailure(error, receipt) {
   return error;
 }
 
-async function startLocalRuntime(client, profile, receipt, connectors, timeoutMs, initialResponse, signal, { autoApprove = false } = {}) {
+async function startLocalRuntime(client, profile, receipt, connectors, timeoutMs, initialResponse, signal, {
+  autoApprove = false, transport = 'http-sse', frontierSocket = null,
+} = {}) {
   const spec = receipt.localRuntime;
   // Memory-only authentication creates fresh device metadata per CLI process.
   // A resumed local task must retain the original caller's routing device.
@@ -559,7 +668,7 @@ async function startLocalRuntime(client, profile, receipt, connectors, timeoutMs
       interactive: Boolean(process.stdin.isTTY && process.stderr.isTTY), workspace: spec.workspace });
   const engine = new HeadlessLocalRuntime({ client, ...spec, accountId: client.accountId, conversationId: receipt.conversationId,
     requestTimeoutMs: timeoutMs, initialResponse, callConnector: connectors ? input => connectors.call(input) : undefined,
-    approve });
+    approve, transport, frontierSocket });
   try { await engine.start({ signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, timeoutMs))]) : AbortSignal.timeout(Math.max(1, timeoutMs)) }); return engine; }
   catch (error) { await engine.close(); if (error.code === 'LOCAL_RUNTIME_BUSY') return null; throw error; }
 }

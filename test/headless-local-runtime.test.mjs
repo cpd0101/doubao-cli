@@ -615,6 +615,59 @@ test('applies native local.workspace.apply operations inside the owned workspace
   await fs.rm(directory, { recursive: true, force: true });
 });
 
+test('workspace apply accepts absolute attachments_dir through tmp/var symlink aliases', async () => {
+  const realParent = await fs.realpath(os.tmpdir());
+  const directory = await fs.mkdtemp(path.join(realParent, 'headless-runtime-attach-symlink-'));
+  let alias = directory;
+  if (process.platform === 'darwin' && directory.startsWith('/private/tmp/')) {
+    alias = `/tmp/${directory.slice('/private/tmp/'.length)}`;
+  } else if (process.platform === 'darwin' && directory.startsWith('/private/var/')) {
+    alias = `/var/${directory.slice('/private/var/'.length)}`;
+  } else {
+    const linkParent = await fs.mkdtemp(path.join(realParent, 'headless-runtime-attach-link-'));
+    alias = path.join(linkParent, 'ws');
+    await fs.symlink(directory, alias);
+  }
+  assert.notEqual(alias, directory);
+  const uploads = [];
+  const runtime = new HeadlessLocalRuntime({ client: { request: async () => responseStream(), json: async (route, options) => {
+    uploads.push({ route, body: JSON.parse(options.body) });
+    return { status_code: 0 };
+  } }, ...base({ workspace: alias }) });
+  const conversation = '38451202562489858';
+  const agent = 'm_0cw3SnPygMN';
+  const attachmentsDir = path.join(alias, `.sessions/${conversation}/attachments`);
+  const request = {
+    request_id: 'init_agent_workspace_symlink_fixture',
+    workspace: { root: alias, session_id: conversation, agent_id: agent },
+    harness_params: {
+      session_id: conversation,
+      attachments_dir: attachmentsDir,
+      sandbox_id: 'sandbox-test-1',
+      tool_result_per_tool_size: 1024,
+      tool_result_head_size: 256,
+      tool_result_tail_size: 256,
+      tool_result_truncate: 1,
+    },
+    operations: [
+      { type: 'ensure_dir', path: `.sessions/${conversation}/attachments` },
+      { type: 'ensure_file', path: `.sessions/${conversation}/board.md` },
+    ],
+  };
+  await runtime.handleFrame({ event_type: 2, sandbox_id: 'sandbox-test-1',
+    signature: { device_id: '123456', user_id: '123456' },
+    command: { id: 'command-init-symlink-attachments', name: 'local.workspace.apply',
+      input: JSON.stringify(request), need_ack: true, option: { agent_id: agent } } });
+  assert.equal(uploads.length, 1);
+  assert.equal(uploads[0].body.command_result.code, 0, uploads[0].body.command_result.message);
+  assert.equal(uploads[0].body.workspace_apply_response.status, 'success');
+  assert.equal(await fs.readFile(path.join(directory, `.sessions/${conversation}/board.md`), 'utf8'), '');
+  await fs.rm(directory, { recursive: true, force: true });
+  if (alias !== directory && !alias.startsWith('/tmp/') && !alias.startsWith('/var/')) {
+    await fs.rm(path.dirname(alias), { recursive: true, force: true });
+  }
+});
+
 test('workspace apply creates missing parents when append/write arrives before init_agent_workspace', async () => {
   const directory = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), 'headless-runtime-workspace-order-'));
   const uploads = [];

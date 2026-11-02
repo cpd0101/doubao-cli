@@ -274,6 +274,32 @@ function lexicalWorkspaceRelativePath(root, input) {
   return { absolute, relative: relative.split(path.sep).join('/') };
 }
 
+function isPathInsideRoot(root, target) {
+  const relative = path.relative(root, target);
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+/**
+ * Resolve a workspace-relative or absolute path that still owns into root after
+ * symlink canonicalization. macOS /tmp → /private/tmp (and /var → /private/var)
+ * make lexical relative checks fail even when the path is inside the workspace.
+ */
+async function resolveOwnedWorkspacePath(root, input) {
+  const lexical = lexicalWorkspaceRelativePath(root, input);
+  if (lexical) {
+    const actual = await nearestRealPath(lexical.absolute);
+    if (!isPathInsideRoot(root, actual)) return null;
+    return { absolute: path.join(root, path.relative(root, actual)), relative: path.relative(root, actual).split(path.sep).join('/') };
+  }
+  if (typeof input !== 'string' || !input || input.includes('\0') || !path.isAbsolute(input)) return null;
+  const normalized = input.replace(/\\/gu, '/');
+  if (normalized.split('/').includes('..') || /^[A-Za-z]:/u.test(normalized) && process.platform !== 'win32') return null;
+  const actual = await nearestRealPath(path.resolve(input));
+  if (!isPathInsideRoot(root, actual)) return null;
+  const relative = path.relative(root, actual).split(path.sep).join('/');
+  return { absolute: path.join(root, relative), relative };
+}
+
 function toolResultForUpload(result) {
   if (!result || typeof result !== 'object' || typeof result.raw_result === 'string' || result.raw_result === undefined) return result;
   const rawResult = JSON.stringify(result.raw_result);
@@ -461,10 +487,16 @@ export function buildHeadlessLocalTaskParam({ workspace, sandboxId = `route-${ra
 export class HeadlessLocalRuntime {
   constructor({ client, sandboxId, deviceId, conversationId, workspace, permission = DEFAULT_HEADLESS_PERMISSION, callConnector,
     approve, onReady = () => {}, onError = () => {}, requestTimeoutMs = 300_000, toolTimeoutMs = 120_000,
-    maxOutputBytes = MAX_RESULT_BYTES, maxToolCalls = MAX_RECORDED_CALLS, journalPath, accountId, initialResponse } = {}) {
+    maxOutputBytes = MAX_RESULT_BYTES, maxToolCalls = MAX_RECORDED_CALLS, journalPath, accountId, initialResponse,
+    transport = 'http-sse', frontierSocket = null } = {}) {
     if (typeof client?.request !== 'function' || typeof client?.json !== 'function') throw new TypeError('runtime client must provide request() and json()');
     this.client = client;
     this.initialResponse = initialResponse;
+    this.transport = transport === 'frontier-ws' ? 'frontier-ws' : 'http-sse';
+    this.frontierSocket = this.transport === 'frontier-ws' ? frontierSocket : null;
+    if (this.transport === 'frontier-ws' && (!this.frontierSocket || typeof this.frontierSocket.addEventListener !== 'function')) {
+      throw new TypeError('frontier-ws transport requires an open frontierSocket');
+    }
     this.sandboxId = requiredString(sandboxId, 'sandbox id', 256);
     this.deviceId = requiredDeviceId(deviceId);
     this.conversationId = requiredString(conversationId, 'conversation id', 64);
@@ -525,6 +557,8 @@ export class HeadlessLocalRuntime {
     if (this.state === 'closed') {
       if (!this.controller.signal.aborted) this.controller.abort(reason);
       try { await this.reader?.cancel(reason); } catch {}
+      try { this.frontierSocket?.close?.(); } catch {}
+      this.frontierSocket = null;
       await this.loopPromise?.catch(() => {});
       this.reader = null;
       try { await this.initialResponse?.body?.cancel?.(); } catch {}
@@ -536,6 +570,8 @@ export class HeadlessLocalRuntime {
     this.state = 'closing';
     if (!this.controller.signal.aborted) this.controller.abort(reason);
     try { await this.reader?.cancel(reason); } catch {}
+    try { this.frontierSocket?.close?.(); } catch {}
+    this.frontierSocket = null;
     try { await this.initialResponse?.body?.cancel?.(reason); } catch {}
     this.initialResponse = null;
     this.externalSignal?.removeEventListener('abort', this.externalAbort);
@@ -708,6 +744,10 @@ export class HeadlessLocalRuntime {
 
   async runLoop() {
     await this.journalReady;
+    if (this.transport === 'frontier-ws') {
+      await this.runFrontierLoop();
+      return;
+    }
     let delayMs = 250;
     while (!this.controller.signal.aborted) {
       let response;
@@ -754,6 +794,87 @@ export class HeadlessLocalRuntime {
     }
     if (!this.readySettled && this.controller.signal.aborted) this.readyReject(this.controller.signal.reason || new Error('Local runtime stopped before connecting'));
     if (!['closing', 'closed'].includes(this.state)) this.state = 'closed';
+  }
+
+  async runFrontierLoop() {
+    const { dispatchPayloadToLocalFrame, extractDispatchPayloads } = await import('./headless-frontier-ws.mjs');
+    const socket = this.frontierSocket;
+    if (!socket) throw new Error('Frontier command websocket is missing');
+    const timing = process.env.DOUBAO_HEADLESS_TIMING === '1';
+    const loopStarted = Date.now();
+    let firstFrameAt = 0;
+    let frameCount = 0;
+    this.state = 'ready';
+    if (!this.readySettled) {
+      this.readySettled = true;
+      this.readyResolve({ ready: true, transport: 'frontier-ws', sandboxId: this.sandboxId, conversationId: this.conversationId });
+      await this.onReady({ sandboxId: this.sandboxId, conversationId: this.conversationId, transport: 'frontier-ws' });
+      if (timing) console.error(`[headless-timing] frontier_loop_ready +${Date.now() - loopStarted}ms`);
+    }
+    const queue = [];
+    let wake = null;
+    const pump = () => { wake?.(); wake = null; };
+    const onMessage = async (event) => {
+      try {
+        const raw = event.data;
+        const buffer = Buffer.isBuffer(raw) ? raw
+          : raw instanceof ArrayBuffer ? Buffer.from(raw)
+          : typeof Blob !== 'undefined' && raw instanceof Blob ? Buffer.from(await raw.arrayBuffer())
+          : Buffer.from(String(raw ?? ''), 'utf8');
+        for (const payload of extractDispatchPayloads(buffer)) {
+          const frame = dispatchPayloadToLocalFrame(payload);
+          if (frame) {
+            frameCount += 1;
+            if (!firstFrameAt) {
+              firstFrameAt = Date.now();
+              if (timing) {
+                const call = frame.tool_call || frame.command || {};
+                console.error(`[headless-timing] first_frame +${firstFrameAt - loopStarted}ms name=${call.name || '?'} id=${call.id || '?'}`);
+              }
+            } else if (timing) {
+              const call = frame.tool_call || frame.command || {};
+              console.error(`[headless-timing] frame_${frameCount} +${Date.now() - loopStarted}ms name=${call.name || '?'}`);
+            }
+            queue.push(frame);
+          }
+        }
+        pump();
+      } catch (error) {
+        this.onError(error);
+      }
+    };
+    const onClose = () => {
+      if (!this.controller.signal.aborted) this.controller.abort(new Error('Frontier command websocket closed'));
+      pump();
+    };
+    const onError = (error) => {
+      this.onError(error?.error || error || new Error('Frontier command websocket error'));
+    };
+    socket.addEventListener('message', onMessage);
+    socket.addEventListener('close', onClose);
+    socket.addEventListener('error', onError);
+    try {
+      while (!this.controller.signal.aborted) {
+        while (queue.length && !this.controller.signal.aborted) {
+          await this.handleFrame(queue.shift());
+        }
+        if (this.controller.signal.aborted) break;
+        await new Promise(resolve => {
+          wake = resolve;
+          this.controller.signal.addEventListener('abort', resolve, { once: true });
+        });
+      }
+    } finally {
+      socket.removeEventListener('message', onMessage);
+      socket.removeEventListener('close', onClose);
+      socket.removeEventListener('error', onError);
+      try { socket.close?.(); } catch {}
+      if (this.frontierSocket === socket) this.frontierSocket = null;
+      if (!this.readySettled && this.controller.signal.aborted) {
+        this.readyReject(this.controller.signal.reason || new Error('Local runtime stopped before connecting'));
+      }
+      if (!['closing', 'closed'].includes(this.state)) this.state = 'closed';
+    }
   }
 
   wait(milliseconds) {
@@ -960,8 +1081,9 @@ export class HeadlessLocalRuntime {
         || request.harness_params.sandbox_id && request.harness_params.sandbox_id !== this.sandboxId) {
         return { success: false, response: workspaceFailure(request.request_id, 'INVALID_REQUEST', 'invalid workspace harness identity') };
       }
-      const attachmentsPath = lexicalWorkspaceRelativePath(configuredRoot, request.harness_params.attachments_dir);
-      if (!attachmentsPath || !this.isPathWithinWorkspace(configuredRoot, await nearestRealPath(attachmentsPath.absolute))) {
+      // macOS /tmp and /var aliases make absolute attachments_dir checks fail.
+      const attachmentsPath = await resolveOwnedWorkspacePath(configuredRoot, request.harness_params.attachments_dir).catch(() => null);
+      if (!attachmentsPath) {
         return { success: false, response: workspaceFailure(request.request_id, 'INVALID_REQUEST', 'attachments directory escapes workspace root') };
       }
     }
@@ -969,20 +1091,14 @@ export class HeadlessLocalRuntime {
     const operationResults = [];
     for (const [index, operation] of request.operations.entries()) {
       checkAbort(this.controller.signal);
-      const resolved = lexicalWorkspaceRelativePath(configuredRoot, operation.path);
-      if (!resolved) {
-        operationResults.push({ operation_index: index, path: operation.path, status: 'failed',
-          error_code: 'PATH_OUTSIDE_WORKSPACE', error_message: 'operation path escapes workspace root' });
-        continue;
-      }
-      let actual;
-      try { actual = await nearestRealPath(resolved.absolute); }
+      let resolved;
+      try { resolved = await resolveOwnedWorkspacePath(configuredRoot, operation.path); }
       catch {
         operationResults.push({ operation_index: index, path: operation.path, status: 'failed',
           error_code: 'PATH_OUTSIDE_WORKSPACE', error_message: 'operation path escapes workspace root' });
         continue;
       }
-      if (!this.isPathWithinWorkspace(configuredRoot, actual)) {
+      if (!resolved) {
         operationResults.push({ operation_index: index, path: operation.path, status: 'failed',
           error_code: 'PATH_OUTSIDE_WORKSPACE', error_message: 'operation path escapes workspace root' });
         continue;
@@ -1002,8 +1118,7 @@ export class HeadlessLocalRuntime {
   }
 
   isPathWithinWorkspace(root, target) {
-    const relative = path.relative(root, target);
-    return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    return isPathInsideRoot(root, target);
   }
 
   /** Create missing parents for file ops. Live Work can send append/write before init_agent_workspace. */
