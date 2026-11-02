@@ -66,7 +66,7 @@ export const optionDefinitions: readonly OptionDefinition[] = [
   { flags: '--json', description: 'Output results as JSON' },
   { flags: '--archived', description: 'List archived sessions instead of active sessions', helpValue: '' },
   { flags: '--all', description: 'Follow all session pages and remove duplicate IDs', helpValue: '' },
-  { flags: '--yes', description: 'Confirm a desktop restart for CDP' },
+  { flags: '--yes', description: 'Confirm desktop CDP restart, or Headless local permission prompts' },
   { flags: '--wait', description: 'Wait for the reply after sending a message', helpValue: '' },
   { flags: '--run <id>', description: 'Select a run for a session operation', helpValue: '<id>', parse: numericId(12, '--run requires a numeric run id') },
   { flags: '--platform <platform>', description: 'Select work, doubao or headless; web aliases headless', parse: choice(['work', 'doubao', 'web', 'headless'], '--platform requires work, doubao, web, or headless') },

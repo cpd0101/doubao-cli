@@ -217,12 +217,16 @@ export async function listHeadlessProfileMetadata({ configDir, timeoutMs = 15_00
 }
 
 export async function executeHeadless(options, { confirmFullAccess = confirmHeadlessFullAccess, fullAccessConfirmed = false } = {}) {
-  // Consent is scoped to this invocation, never persisted in a recovery receipt
-  // or accepted through a CLI flag such as --yes.
+  // Consent is scoped to this invocation and never persisted in a recovery receipt.
+  // `--yes` may confirm for the current create/send/wait only.
   const authorizeFullAccess = async workspace => {
     if (fullAccessConfirmed === true) return;
+    if (options.yes === true) {
+      fullAccessConfirmed = true;
+      return;
+    }
     if (await confirmFullAccess({ workspace }) !== true) {
-      throw Object.assign(new Error('FullAccess requires explicit confirmation in an interactive terminal; use AskOnRisk or AlwaysAsk otherwise'),
+      throw Object.assign(new Error('FullAccess requires explicit confirmation in an interactive terminal or --yes; use AskOnRisk or AlwaysAsk otherwise'),
         { code: 'FULL_ACCESS_CONFIRMATION_REQUIRED' });
     }
     fullAccessConfirmed = true;
@@ -443,7 +447,7 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
         if (localRuntime && options.wait && receipt.accepted && receipt.conversationId && !enginePromise) {
           const initialResponse = localChannel;
           localChannel = null;
-          enginePromise = initialResponse.then(response => startLocalRuntime(client, profile, receipt, connectors, remaining(), response, localChannelAbort?.signal));
+          enginePromise = initialResponse.then(response => startLocalRuntime(client, profile, receipt, connectors, remaining(), response, localChannelAbort?.signal, { autoApprove: options.yes === true }));
           enginePromise.catch(() => {});
         }
         if (receipt.accepted && !reportedAcceptance && options.onAccepted) {
@@ -502,7 +506,7 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
         const wait = signal => waitTurn(client, receipt.conversationId, { runId: receipt.runId, receipt, deadline, signal,
           onReceipt: checkpoint, loadReceipt: run => store.read(receipt.conversationId, run) });
         const result = localRuntime ? await waitWithLocalRuntime(wait,
-          () => enginePromise ||= startLocalRuntime(client, profile, receipt, connectors, remaining(), undefined, localChannelAbort?.signal),
+          () => enginePromise ||= startLocalRuntime(client, profile, receipt, connectors, remaining(), undefined, localChannelAbort?.signal, { autoApprove: options.yes === true }),
           { abortStartup: () => localChannelAbort?.abort() }) : await wait();
         return { platform: 'headless', mode, ...(goalId ? { goalId } : {}), context: { runtime: runtimeChoice, ...(localRuntime ? { workspace: localRuntime.workspace } : {}),
           projectId: taskContext.projectId || null, enterpriseKnowledge: Boolean(taskContext.enterpriseSkill) }, accepted: true, ...result };
@@ -531,7 +535,7 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
     const wait = signal => operation(client, conversationId, { runId: receipt.runId, receipt, deadline, timeoutMs: remaining(), signal,
       onReceipt: next => store.save(next), loadReceipt: run => store.read(conversationId, run) });
     const result = needsRuntime ? await waitWithLocalRuntime(wait,
-      () => startLocalRuntime(client, profile, receipt, connectors, remaining(), undefined, runtimeAbort.signal),
+      () => startLocalRuntime(client, profile, receipt, connectors, remaining(), undefined, runtimeAbort.signal, { autoApprove: options.yes === true }),
       { abortStartup: () => runtimeAbort.abort() }) : await wait();
     return { platform: 'headless', ...(result.result || result) };
   } finally { runtimeAbort.abort(); await connectors?.close(); }
@@ -544,15 +548,18 @@ function acceptedLocalFailure(error, receipt) {
   return error;
 }
 
-async function startLocalRuntime(client, profile, receipt, connectors, timeoutMs, initialResponse, signal) {
+async function startLocalRuntime(client, profile, receipt, connectors, timeoutMs, initialResponse, signal, { autoApprove = false } = {}) {
   const spec = receipt.localRuntime;
   // Memory-only authentication creates fresh device metadata per CLI process.
   // A resumed local task must retain the original caller's routing device.
   client.device = { ...client.device, device_id: spec.deviceId };
+  const approve = autoApprove === true
+    ? async request => !(request?.signal?.aborted)
+    : createHeadlessApproval({ input: process.stdin, output: process.stderr,
+      interactive: Boolean(process.stdin.isTTY && process.stderr.isTTY), workspace: spec.workspace });
   const engine = new HeadlessLocalRuntime({ client, ...spec, accountId: client.accountId, conversationId: receipt.conversationId,
     requestTimeoutMs: timeoutMs, initialResponse, callConnector: connectors ? input => connectors.call(input) : undefined,
-    approve: createHeadlessApproval({ input: process.stdin, output: process.stderr,
-      interactive: Boolean(process.stdin.isTTY && process.stderr.isTTY), workspace: spec.workspace }) });
+    approve });
   try { await engine.start({ signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, timeoutMs))]) : AbortSignal.timeout(Math.max(1, timeoutMs)) }); return engine; }
   catch (error) { await engine.close(); if (error.code === 'LOCAL_RUNTIME_BUSY') return null; throw error; }
 }

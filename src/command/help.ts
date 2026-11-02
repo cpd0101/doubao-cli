@@ -42,7 +42,8 @@ ${HEADLESS_SELECTOR}
   --runtime local|cloud  Work task runtime (default: cloud; local options select local)
   --attach <path>  Upload a file or image; repeat for multiple attachments
   --workspace <path> / --no-skills  Configure local task files and skills
-  --permission FullAccess|AskOnRisk|AlwaysAsk  New: AskOnRisk; follow-ups inherit; FullAccess requires TTY confirmation
+  --permission FullAccess|AskOnRisk|AlwaysAsk  New: AskOnRisk; follow-ups inherit; FullAccess requires confirmation
+  --yes  Confirm FullAccess / local tool prompts without a TTY answer (create/send/wait)
   --mcp <connector-id>  Use a registered stdio connector with local tasks; repeat as needed
   --timeout <seconds>  Request or wait budget (default: 120)
   --expect-json / --reply-schema <path>  Validate the final reply; create/send require --wait

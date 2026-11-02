@@ -10,7 +10,10 @@ function allowed(flag, command, backend) {
   const sessionMessage = SESSION_CREATE_OR_SEND(command);
   const sessionState = SESSION_STATE(command);
   switch (flag) {
-    case '--yes': return backend === 'desktop' && command[0] === 'cdp' && command[1] === 'launch';
+    case '--yes':
+      if (backend === 'desktop') return command[0] === 'cdp' && command[1] === 'launch';
+      if (backend === 'headless') return command[0] === 'sessions' && ['create', 'send', 'wait'].includes(command[1]);
+      return false;
     case '--limit': return SESSION_LIST_OR_READ(command);
     case '--archived': return command[0] === 'sessions' && command[1] === 'list';
     case '--all': return command[0] === 'sessions' && command[1] === 'list';
@@ -78,7 +81,10 @@ function optionError(flag, command, backend) {
   if (flag === '--run') return '--run requires sessions status/wait/stop';
   if (flag === '--mode') return '--mode requires doubao web sessions create or doubao headless sessions create (or a matching --platform selector)';
   if (flag === '--timeout') return `${flag} is not valid for ${command.join(' ') || 'this command'}`;
-  if (flag === '--yes') return '--yes requires cdp launch on a desktop platform';
+  if (flag === '--yes') {
+    if (backend === 'headless') return '--yes requires headless sessions create/send/wait';
+    return '--yes requires cdp launch on a desktop platform';
+  }
   if (flag === '--limit') return '--limit requires sessions list or read';
   if (flag === '--archived') return '--archived requires sessions list';
   if (flag === '--all') return '--all requires sessions list';

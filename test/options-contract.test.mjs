@@ -20,7 +20,11 @@ test('all-session traversal is shared by Desktop and Headless and cannot silentl
 test('explicit confirmation and limits are accepted only where handlers use them', () => {
   assert.equal(desktop(['cdp', 'launch', '--yes']).yes, true);
   assert.throws(() => desktop(['sessions', 'create', 'hello', '--yes']), /--yes requires cdp launch/u);
-  assert.throws(() => web(['cdp', 'launch', '--yes']), /desktop platform/u);
+  assert.throws(() => web(['cdp', 'launch', '--yes']), /(?:desktop platform|headless sessions create\/send\/wait)/u);
+  assert.equal(headless(['sessions', 'create', 'hello', '--yes']).yes, true);
+  assert.equal(headless(['sessions', 'send', '38439138239851266', 'hello', '--yes']).yes, true);
+  assert.equal(headless(['sessions', 'wait', '38439138239851266', '--yes']).yes, true);
+  assert.throws(() => headless(['sessions', 'list', '--yes']), /--yes requires headless sessions create\/send\/wait/u);
   assert.equal(headless(['sessions', 'list', '--limit', '8']).limit, 8);
   assert.equal(headless(['sessions', 'read', '38439138239851266', '--limit', '8']).limit, 8);
   assert.equal(web(['sessions', 'read', '38439138239851266', '--limit', '8']).limit, 8);

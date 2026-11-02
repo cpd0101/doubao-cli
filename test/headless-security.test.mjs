@@ -76,23 +76,30 @@ test('local runtime defaults to AskOnRisk and denies shell mutations without app
   await runtime.close();
 });
 
-test('FullAccess refuses non-TTY, --yes, forged option consent and non-true callbacks before local effects', async t => {
+test('FullAccess refuses non-TTY and non-true callbacks, while --yes confirms only for this invocation', async t => {
   const fx = fixture(t);
   const absentWorkspace = path.join(fx.directory, 'never-created');
   for (const wait of [[], ['--wait']]) {
     const options = ['sessions', 'create', 'fixture', '--runtime', 'local', '--workspace', absentWorkspace,
       '--permission', 'full-access', ...wait];
-    assert.throws(() => parseOptions(['headless', ...options, '--yes']), /--yes requires cdp launch/u);
     await assert.rejects(fx.run(options), error => error.code === 'FULL_ACCESS_CONFIRMATION_REQUIRED');
     for (const answer of [false, undefined, 'yes', 1]) {
       await assert.rejects(fx.run(options, { confirmFullAccess: async () => answer }),
         error => error.code === 'FULL_ACCESS_CONFIRMATION_REQUIRED');
     }
-    const forged = { ...parseOptions(['headless', ...options]), fullAccessConfirmed: true, yes: true };
+    // Forged options.fullAccessConfirmed is ignored; only the executeHeadless dependency may pre-confirm.
+    const forged = { ...parseOptions(['headless', ...options]), fullAccessConfirmed: true };
     await assert.rejects(withApp(app, () => executeHeadless(forged)), error => error.code === 'FULL_ACCESS_CONFIRMATION_REQUIRED');
   }
   assert.equal(fs.existsSync(absentWorkspace), false);
   assert.ok(fx.state.routes.every(route => route === '/passport/account/info/v2/'));
+
+  const withYes = await fx.run(['sessions', 'create', 'fixture', '--runtime', 'local', '--workspace', fx.workspace,
+    '--no-skills', '--permission', 'FullAccess', '--wait', '--yes'], { confirmFullAccess: async () => {
+    assert.fail('--yes must not call the interactive FullAccess prompt');
+  } });
+  assert.equal(withYes.status, 'completed');
+  assert.equal(fx.state.bodies.at(-1).option.general_task_param.agent_task_param.sandbox_auth_type, 2);
 });
 
 test('local follow-ups inherit FullAccess with fresh consent and honor an explicit permission override', async t => {
@@ -149,4 +156,9 @@ test('recovering a FullAccess receipt requires fresh confirmation before startin
     error => error.code === 'FULL_ACCESS_CONFIRMATION_REQUIRED');
   assert.equal(fx.state.routes.includes('/alice/office/tool_local/chunk_stream'), false);
   assert.equal(fx.state.bodies.length, 0);
+
+  await assert.rejects(fx.run(['sessions', 'wait', CONVERSATION, '--run', RUN, '--yes', '--timeout', '1'], {
+    confirmFullAccess: async () => assert.fail('--yes must not call the interactive FullAccess prompt'),
+  }), error => error.code === 'timeout' || /timed out/iu.test(error.message));
+  assert.equal(fx.state.routes.includes('/alice/office/tool_local/chunk_stream'), true);
 });
