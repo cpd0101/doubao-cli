@@ -987,6 +987,20 @@ export class HeadlessLocalRuntime {
     return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
   }
 
+  /** Create missing parents for file ops. Live Work can send append/write before init_agent_workspace. */
+  async ensureWorkspaceParentDirectory(target) {
+    const parent = path.dirname(target);
+    if (!parent || parent === target) return;
+    const workspaceRoot = await fs.realpath(this.workspace);
+    await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+    const parentReal = await fs.realpath(parent);
+    if (!this.isPathWithinWorkspace(workspaceRoot, parentReal)) {
+      const error = new Error('parent directory escapes workspace root');
+      error.code = 'PATH_OUTSIDE_WORKSPACE';
+      throw error;
+    }
+  }
+
   async applyWorkspaceOperation(operation, target, operationIndex) {
     if (this.permissionName !== 'FullAccess') {
       let approved = false;
@@ -1003,6 +1017,7 @@ export class HeadlessLocalRuntime {
       if (operation.type === 'ensure_dir') {
         await fs.mkdir(target, { recursive: true, mode: 0o700 });
       } else if (operation.type === 'ensure_file') {
+        await this.ensureWorkspaceParentDirectory(target);
         const handle = await fs.open(target, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW || 0), 0o600)
           .catch(async error => {
             if (error.code !== 'EEXIST') throw error;
@@ -1012,6 +1027,7 @@ export class HeadlessLocalRuntime {
           });
         await handle?.close();
       } else if (operation.type === 'write_file') {
+        await this.ensureWorkspaceParentDirectory(target);
         const mode = operation.mode;
         if (mode === 'keep' || mode === 'create_only') {
           const handle = await fs.open(target, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW || 0), 0o600)

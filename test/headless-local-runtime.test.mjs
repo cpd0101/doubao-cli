@@ -614,6 +614,54 @@ test('applies native local.workspace.apply operations inside the owned workspace
   await fs.rm(directory, { recursive: true, force: true });
 });
 
+test('workspace apply creates missing parents when append/write arrives before init_agent_workspace', async () => {
+  const directory = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), 'headless-runtime-workspace-order-'));
+  const uploads = [];
+  const runtime = new HeadlessLocalRuntime({ client: { request: async () => responseStream(), json: async (route, options) => {
+    uploads.push({ route, body: JSON.parse(options.body) });
+    return { status_code: 0 };
+  } }, ...base({ workspace: directory }) });
+  const conversation = '38451201775587074';
+  const agent = 'm_0cw3SnGHm1o';
+  const trajectory = `.sessions/${conversation}/agents/${agent}/system/trajectory.jsonl`;
+  const append = { request_id: 'append_workspace_trajectory_memory_fixture',
+    workspace: { root: directory, session_id: conversation, agent_id: agent },
+    operations: [{ type: 'write_file', path: trajectory, mode: 'append', content: '{"event":"start"}\n' }] };
+  const init = { request_id: 'init_agent_workspace_fixture',
+    workspace: { root: directory, session_id: conversation, agent_id: agent },
+    operations: [
+      { type: 'ensure_dir', path: `.sessions/${conversation}/memory` },
+      { type: 'ensure_file', path: `.sessions/${conversation}/memory/MEMORY.md` },
+      { type: 'ensure_dir', path: `.sessions/${conversation}/attachments` },
+      { type: 'ensure_file', path: `.sessions/${conversation}/board.md` },
+      { type: 'ensure_dir', path: `.sessions/${conversation}/agents/${agent}/scratch` },
+      { type: 'ensure_dir', path: `.sessions/${conversation}/agents/${agent}/system/tool-results` },
+      { type: 'ensure_file', path: `.sessions/${conversation}/agents/${agent}/system/assignment.md` },
+      { type: 'ensure_file', path: trajectory },
+      { type: 'ensure_dir', path: `.sessions/${conversation}/agents/${agent}/socket` },
+      { type: 'ensure_file', path: `.sessions/${conversation}/agents/${agent}/socket/briefing.md` },
+      { type: 'ensure_file', path: `.sessions/${conversation}/agents/${agent}/socket/findings.jsonl` },
+      { type: 'ensure_dir', path: `.sessions/${conversation}/agents/${agent}/poll-monitors/scripts` },
+      { type: 'ensure_dir', path: `.sessions/${conversation}/agents/${agent}/poll-monitors/states` },
+      { type: 'ensure_dir', path: `.sessions/${conversation}/agents/${agent}/system/poll-monitors` },
+    ] };
+  const frame = (id, request) => ({ event_type: 2, sandbox_id: 'sandbox-test-1',
+    signature: { device_id: '123456', user_id: '123456' },
+    command: { id, name: 'local.workspace.apply', input: JSON.stringify(request), need_ack: true,
+      option: { agent_id: agent } } });
+
+  // Live Headless Work has been observed sending append before init.
+  await runtime.handleFrame(frame('command-append-before-init', append));
+  await runtime.handleFrame(frame('command-init-after-append', init));
+
+  assert.equal(uploads.length, 2);
+  assert.equal(uploads[0].body.command_result.code, 0);
+  assert.equal(uploads[1].body.command_result.code, 0);
+  assert.equal(await fs.readFile(path.join(directory, trajectory), 'utf8'), '{"event":"start"}\n');
+  assert.equal(await fs.readFile(path.join(directory, `.sessions/${conversation}/board.md`), 'utf8'), '');
+  await fs.rm(directory, { recursive: true, force: true });
+});
+
 test('workspace apply rejects traversal and requires approval for every write outside FullAccess', async () => {
   const directory = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), 'headless-runtime-workspace-policy-'));
   let approvals = 0;
