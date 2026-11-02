@@ -172,6 +172,25 @@ async function permissionRisk(permission, toolName, input, workspace) {
   return null;
 }
 
+/** Work bootstraps agent state under `.sessions/<conversationId>/` before user tools. */
+export function isAgentSessionScaffoldPath(workspaceRelativePath, conversationId) {
+  if (typeof workspaceRelativePath !== 'string' || !workspaceRelativePath || typeof conversationId !== 'string' || !ID.test(conversationId)) {
+    return false;
+  }
+  const normalized = workspaceRelativePath.replaceAll('\\', '/').replace(/^\.\//u, '');
+  if (normalized.split('/').includes('..')) return false;
+  const prefix = `.sessions/${conversationId}`;
+  return normalized === prefix || normalized.startsWith(`${prefix}/`);
+}
+
+/** AskOnRisk auto-allows session scaffolding; AlwaysAsk still prompts; repo writes stay gated. */
+export function workspaceApplyRequiresApproval(permission, operationPath, conversationId) {
+  if (permission === 'FullAccess') return false;
+  if (permission === 'AlwaysAsk') return true;
+  if (isAgentSessionScaffoldPath(operationPath, conversationId)) return false;
+  return true;
+}
+
 function boundedText(value, maxBytes = MAX_RESULT_BYTES) {
   const text = String(value ?? '');
   const bytes = Buffer.from(text);
@@ -1002,7 +1021,7 @@ export class HeadlessLocalRuntime {
   }
 
   async applyWorkspaceOperation(operation, target, operationIndex) {
-    if (this.permissionName !== 'FullAccess') {
+    if (workspaceApplyRequiresApproval(this.permissionName, operation?.path, this.conversationId)) {
       let approved = false;
       if (typeof this.approve === 'function') {
         approved = await abortable(Promise.resolve(this.approve({ toolName: 'local.workspace.apply', input: operation,
