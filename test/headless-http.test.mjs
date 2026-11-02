@@ -96,3 +96,17 @@ test('an unterminated final SSE frame is not delivered as a completed event', as
   await consumeSse(streamResponse([bytes]), (...event) => events.push(event));
   assert.deepEqual(events, []);
 });
+
+test('consumeSse exits promptly when its abort signal fires during a blocked read', async () => {
+  const controller = new AbortController();
+  const response = new Response(new ReadableStream({
+    start() {
+      // Never enqueue or close — reader.read() stays pending until abort.
+    },
+  }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  const started = Date.now();
+  const pending = consumeSse(response, () => {}, { signal: controller.signal });
+  setTimeout(() => controller.abort(new DOMException('stop', 'AbortError')), 30);
+  await pending;
+  assert.ok(Date.now() - started < 500, `abort should unblock consumeSse quickly, took ${Date.now() - started}ms`);
+});

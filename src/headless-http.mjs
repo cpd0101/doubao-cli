@@ -145,8 +145,34 @@ export class HeadlessClient {
   }
 }
 
+function abortError(signal) {
+  return signal?.reason || new DOMException('Aborted', 'AbortError');
+}
+
+function isAbortError(error) {
+  return error?.name === 'AbortError' || error?.code === 20;
+}
+
+/** Resolve the next SSE body chunk, or reject promptly when `signal` aborts. */
+function readSseChunk(reader, signal) {
+  if (signal?.aborted) return Promise.reject(abortError(signal));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      reader.cancel(abortError(signal)).catch(() => {});
+      reject(abortError(signal));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    reader.read().then(
+      (value) => { signal?.removeEventListener('abort', onAbort); resolve(value); },
+      (error) => { signal?.removeEventListener('abort', onAbort); reject(error); },
+    );
+  });
+}
+
 // Works on arbitrary UTF-8/chunk/CRLF boundaries. An unterminated stream is not success.
-export async function consumeSse(response, onEvent) {
+// `signal` aborts a blocked read immediately (e.g. Frontier agent_task_status early-complete);
+// abort exits cleanly without treating the stream as a protocol failure.
+export async function consumeSse(response, onEvent, { signal } = {}) {
   if (!response.ok || !response.headers.get('content-type')?.includes('text/event-stream')) {
     throw new Error(`Doubao completion did not return an event stream (${response.status})`);
   }
@@ -156,7 +182,13 @@ export async function consumeSse(response, onEvent) {
   let buffer = '';
   try {
     for (;;) {
-      const part = await reader.read();
+      let part;
+      try {
+        part = await readSseChunk(reader, signal);
+      } catch (error) {
+        if (signal?.aborted || isAbortError(error)) return;
+        throw error;
+      }
       buffer += decoder.decode(part.value, { stream: !part.done });
       if (buffer.length > 4 * 1024 * 1024) throw new Error('Doubao event frame exceeds the size limit');
       let delimiter;

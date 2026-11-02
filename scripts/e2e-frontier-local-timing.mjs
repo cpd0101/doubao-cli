@@ -73,9 +73,10 @@ function runDoubao(args, env = {}) {
 
 async function runTransport(label) {
   const transport = label === 'frontier' ? 'frontier' : 'sse';
-  const env = transport === 'frontier' ? { DOUBAO_HEADLESS_LOCAL_TRANSPORT: 'frontier-ws' } : {};
-  // Ensure SSE is not left on multi_env from a prior frontier run inside this process tree.
-  if (transport === 'sse') env.DOUBAO_HEADLESS_LOCAL_TRANSPORT = '';
+  // Default CLI transport is frontier-ws; force http-sse explicitly for the SSE arm.
+  const env = {
+    DOUBAO_HEADLESS_LOCAL_TRANSPORT: transport === 'frontier' ? 'frontier-ws' : 'http-sse',
+  };
   const prompts = promptsFor(transport);
   const workspace = mkdtempSync(path.join(os.tmpdir(), `doubao-${label}-`));
 
