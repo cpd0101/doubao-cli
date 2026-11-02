@@ -663,7 +663,7 @@ test('workspace apply creates missing parents when append/write arrives before i
   await fs.rm(directory, { recursive: true, force: true });
 });
 
-test('AskOnRisk auto-allows current-session scaffold paths and still gates repo writes', () => {
+test('AskOnRisk and AlwaysAsk auto-allow current-session scaffold paths and still gate repo writes', () => {
   assert.equal(isAgentSessionScaffoldPath(`.sessions/${conversationId}/board.md`, conversationId), true);
   assert.equal(isAgentSessionScaffoldPath(`.sessions/${conversationId}/agents/a/system/trajectory.jsonl`, conversationId), true);
   assert.equal(isAgentSessionScaffoldPath('.sessions/9999999999999999/board.md', conversationId), false);
@@ -673,7 +673,8 @@ test('AskOnRisk auto-allows current-session scaffold paths and still gates repo 
   assert.equal(workspaceApplyRequiresApproval('FullAccess', 'denied.txt', conversationId), false);
   assert.equal(workspaceApplyRequiresApproval('AskOnRisk', `.sessions/${conversationId}/memory/MEMORY.md`, conversationId), false);
   assert.equal(workspaceApplyRequiresApproval('AskOnRisk', 'denied.txt', conversationId), true);
-  assert.equal(workspaceApplyRequiresApproval('AlwaysAsk', `.sessions/${conversationId}/board.md`, conversationId), true);
+  assert.equal(workspaceApplyRequiresApproval('AlwaysAsk', `.sessions/${conversationId}/board.md`, conversationId), false);
+  assert.equal(workspaceApplyRequiresApproval('AlwaysAsk', 'denied.txt', conversationId), true);
 });
 
 test('workspace apply rejects traversal and requires approval for non-scaffold writes under AskOnRisk', async () => {
@@ -702,43 +703,45 @@ test('workspace apply rejects traversal and requires approval for non-scaffold w
   await fs.rm(directory, { recursive: true, force: true });
 });
 
-test('AskOnRisk applies session scaffold without prompts and still asks before Bash', async () => {
-  const directory = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), 'headless-runtime-askonrisk-scaffold-'));
-  const approvals = [];
-  const uploads = [];
-  const runtime = new HeadlessLocalRuntime({ client: { request: async () => responseStream(), json: async (route, options) => {
-    uploads.push({ route, body: JSON.parse(options.body) });
-    return { status_code: 0 };
-  } }, ...base({ workspace: directory, permission: 'AskOnRisk', approve: async request => {
-    approvals.push(request);
-    return request.toolName === 'Bash';
-  } }) });
-  const scaffoldPath = `.sessions/${conversationId}/agents/agent-fixture/system/trajectory.jsonl`;
-  const append = { request_id: 'append_fixture', workspace: { root: directory, session_id: conversationId, agent_id: 'agent-fixture' },
-    operations: [{ type: 'write_file', path: scaffoldPath, mode: 'append', content: '{"ok":true}\n' }] };
-  const init = { request_id: 'init_fixture', workspace: { root: directory, session_id: conversationId, agent_id: 'agent-fixture' },
-    operations: [
-      { type: 'ensure_dir', path: `.sessions/${conversationId}/memory` },
-      { type: 'ensure_file', path: `.sessions/${conversationId}/board.md` },
-      { type: 'ensure_file', path: scaffoldPath },
-    ] };
-  const commandFrame = (id, request) => ({ event_type: 2, sandbox_id: 'sandbox-test-1',
-    signature: { device_id: '123456', user_id: '123456' },
-    command: { id, name: 'local.workspace.apply', input: JSON.stringify(request), need_ack: true,
-      option: { agent_id: 'agent-fixture' } } });
+for (const permission of ['AskOnRisk', 'AlwaysAsk']) {
+  test(`${permission} applies session scaffold without prompts and still asks before Bash`, async () => {
+    const directory = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), `headless-runtime-${permission.toLowerCase()}-scaffold-`));
+    const approvals = [];
+    const uploads = [];
+    const runtime = new HeadlessLocalRuntime({ client: { request: async () => responseStream(), json: async (route, options) => {
+      uploads.push({ route, body: JSON.parse(options.body) });
+      return { status_code: 0 };
+    } }, ...base({ workspace: directory, permission, approve: async request => {
+      approvals.push(request);
+      return request.toolName === 'Bash';
+    } }) });
+    const scaffoldPath = `.sessions/${conversationId}/agents/agent-fixture/system/trajectory.jsonl`;
+    const append = { request_id: 'append_fixture', workspace: { root: directory, session_id: conversationId, agent_id: 'agent-fixture' },
+      operations: [{ type: 'write_file', path: scaffoldPath, mode: 'append', content: '{"ok":true}\n' }] };
+    const init = { request_id: 'init_fixture', workspace: { root: directory, session_id: conversationId, agent_id: 'agent-fixture' },
+      operations: [
+        { type: 'ensure_dir', path: `.sessions/${conversationId}/memory` },
+        { type: 'ensure_file', path: `.sessions/${conversationId}/board.md` },
+        { type: 'ensure_file', path: scaffoldPath },
+      ] };
+    const commandFrame = (id, request) => ({ event_type: 2, sandbox_id: 'sandbox-test-1',
+      signature: { device_id: '123456', user_id: '123456' },
+      command: { id, name: 'local.workspace.apply', input: JSON.stringify(request), need_ack: true,
+        option: { agent_id: 'agent-fixture' } } });
 
-  await runtime.handleFrame(commandFrame('command-append', append));
-  await runtime.handleFrame(commandFrame('command-init', init));
-  await runtime.handleFrame(toolFrame({ name: 'Bash', input: { command: 'printf fixture > bash-output.txt' } }));
+    await runtime.handleFrame(commandFrame('command-append', append));
+    await runtime.handleFrame(commandFrame('command-init', init));
+    await runtime.handleFrame(toolFrame({ name: 'Bash', input: { command: 'printf fixture > bash-output.txt' } }));
 
-  assert.equal(approvals.length, 1);
-  assert.equal(approvals[0].toolName, 'Bash');
-  assert.equal(uploads.filter(item => item.route === '/alice/office/tool_local/upload_command_result').length, 2);
-  assert.equal(uploads.at(-1).route, '/alice/office/tool_local/upload_tool_call_result');
-  assert.equal(await fs.readFile(path.join(directory, scaffoldPath), 'utf8'), '{"ok":true}\n');
-  assert.equal(await fs.readFile(path.join(directory, 'bash-output.txt'), 'utf8'), 'fixture');
-  await fs.rm(directory, { recursive: true, force: true });
-});
+    assert.equal(approvals.length, 1);
+    assert.equal(approvals[0].toolName, 'Bash');
+    assert.equal(uploads.filter(item => item.route === '/alice/office/tool_local/upload_command_result').length, 2);
+    assert.equal(uploads.at(-1).route, '/alice/office/tool_local/upload_tool_call_result');
+    assert.equal(await fs.readFile(path.join(directory, scaffoldPath), 'utf8'), '{"ok":true}\n');
+    assert.equal(await fs.readFile(path.join(directory, 'bash-output.txt'), 'utf8'), 'fixture');
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+}
 
 test('close releases its lease even after the event loop has already marked the runtime closed', async () => {
   const directory = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), 'headless-runtime-close-'));

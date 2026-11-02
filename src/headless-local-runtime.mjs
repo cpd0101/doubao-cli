@@ -183,12 +183,12 @@ export function isAgentSessionScaffoldPath(workspaceRelativePath, conversationId
   return normalized === prefix || normalized.startsWith(`${prefix}/`);
 }
 
-/** AskOnRisk auto-allows session scaffolding; AlwaysAsk still prompts; repo writes stay gated. */
+/** AskOnRisk/AlwaysAsk auto-allow session scaffolding; other workspace writes stay gated. */
 export function workspaceApplyRequiresApproval(permission, operationPath, conversationId) {
   if (permission === 'FullAccess') return false;
-  if (permission === 'AlwaysAsk') return true;
+  // Agent bootstrap under .sessions/<conversationId>/ is not a meaningful user prompt.
   if (isAgentSessionScaffoldPath(operationPath, conversationId)) return false;
-  return true;
+  return permission === 'AlwaysAsk' || permission === 'AskOnRisk';
 }
 
 function boundedText(value, maxBytes = MAX_RESULT_BYTES) {
