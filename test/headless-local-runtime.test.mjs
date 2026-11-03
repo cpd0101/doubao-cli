@@ -60,7 +60,7 @@ test('accepts readiness only after SSE and sends route scope and resume header',
   const runtime = new HeadlessLocalRuntime({ client, ...base() });
   const ready = await runtime.start();
   assert.equal(ready.ready, true);
-  assert.equal(ready.transport, 'http-sse');
+  assert.equal(ready.transport, 'sse');
   assert.equal(requests[0].route, '/alice/office/tool_local/chunk_stream');
   assert.deepEqual(requests[0].options.params, { sand_box_id: 'sandbox-test-1', client_version: 'unspecified' });
   assert.deepEqual(JSON.parse(requests[0].options.body), { device_id: '123456', client_attrs: { sandbox_id: 'sandbox-test-1' } });

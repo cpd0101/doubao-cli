@@ -61,13 +61,13 @@ async function validateSseResponse(response) {
 }
 
 /** Open the sandbox-scoped SSE request before task completion so the server can bind delivery to the live channel. */
-export async function prepareHeadlessLocalChannel(client, { sandboxId, deviceId, timeoutMs = 300_000, signal } = {}) {
+export async function prepareHeadlessLocalChannel(client, { sandboxId, deviceId, timeoutMs = 300_000, signal, lastEventId = '' } = {}) {
   if (typeof client?.request !== 'function') throw new TypeError('runtime client must provide request()');
   const routeId = requiredString(sandboxId, 'sandbox id', 256);
   const device = requiredDeviceId(deviceId);
   const boundedTimeout = Math.max(1000, Math.min(2_147_000_000, timeoutMs));
   const pendingResponse = client.request(SSE_PATH, localChannelRequestOptions({
-    sandboxId: routeId, deviceId: device, timeoutMs: boundedTimeout, signal,
+    sandboxId: routeId, deviceId: device, timeoutMs: boundedTimeout, signal, lastEventId,
   }));
   const response = await abortable(pendingResponse, signal, value => value?.body?.cancel?.());
   if (signal?.aborted) {
@@ -75,6 +75,135 @@ export async function prepareHeadlessLocalChannel(client, { sandboxId, deviceId,
     throw signal.reason || new DOMException('Aborted', 'AbortError');
   }
   return validateSseResponse(response);
+}
+
+/**
+ * Desktop-aligned standing `/chunk_stream` keepalive for a sticky sandbox.
+ * Client does not send heartbeats; any inbound byte (incl. event_type=3) resets the
+ * silence timer. After silenceTimeoutMs without bytes, abort and re-POST with backoff.
+ */
+export function createChunkStreamKeepalive({
+  client,
+  sandboxId,
+  deviceId,
+  silenceTimeoutMs = 18_000,
+  minBackoffMs = 1_000,
+  maxBackoffMs = 30_000,
+  openChannel = prepareHeadlessLocalChannel,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+  sleep = (ms) => new Promise(resolve => setTimer(resolve, ms)),
+  onError = () => {},
+} = {}) {
+  const routeId = requiredString(sandboxId, 'sandbox id', 256);
+  const device = requiredDeviceId(deviceId);
+  let stopped = false;
+  let paused = false;
+  let generation = 0;
+  let silenceTimer = null;
+  let activeAbort = null;
+  let loopPromise = null;
+  let lastEventId = '';
+  let reconnectAttempt = 0;
+
+  const clearSilence = () => {
+    if (silenceTimer) clearTimer(silenceTimer);
+    silenceTimer = null;
+  };
+
+  const armSilence = (abortController) => {
+    clearSilence();
+    silenceTimer = setTimer(() => {
+      silenceTimer = null;
+      try { abortController.abort(new DOMException('SSE silence timeout', 'AbortError')); } catch {}
+    }, Math.max(1, silenceTimeoutMs));
+  };
+
+  const runOnce = async (abortController) => {
+    const response = await openChannel(client, {
+      sandboxId: routeId, deviceId: device, timeoutMs: 300_000, signal: abortController.signal, lastEventId,
+    });
+    reconnectAttempt = 0;
+    const body = response.body;
+    if (!body || typeof body.getReader !== 'function') {
+      try { await response.body?.cancel?.(); } catch {}
+      throw new Error('Standing chunk_stream response has no readable body');
+    }
+    const reader = body.getReader();
+    armSilence(abortController);
+    try {
+      while (!abortController.signal.aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value?.byteLength || (typeof value === 'string' && value.length)) {
+          armSilence(abortController);
+          // Best-effort Last-Event-ID: scan ASCII for "id:" lines.
+          try {
+            const text = Buffer.isBuffer(value) ? value.toString('utf8')
+              : value instanceof Uint8Array ? Buffer.from(value).toString('utf8')
+                : String(value);
+            const match = text.match(/(?:^|\n)id:\s*(\S+)/u);
+            if (match?.[1]) lastEventId = match[1].slice(0, 1024);
+          } catch {}
+        }
+      }
+    } finally {
+      clearSilence();
+      try { await reader.cancel(); } catch {}
+      try { await body.cancel?.(); } catch {}
+    }
+  };
+
+  const loop = async () => {
+    while (!stopped) {
+      if (paused) {
+        await sleep(100);
+        continue;
+      }
+      const myGen = generation;
+      const abortController = new AbortController();
+      activeAbort = abortController;
+      try {
+        await runOnce(abortController);
+      } catch (error) {
+        if (!stopped && myGen === generation) onError(error);
+      } finally {
+        if (activeAbort === abortController) activeAbort = null;
+        clearSilence();
+      }
+      if (stopped || paused) continue;
+      const delay = Math.min(maxBackoffMs, minBackoffMs * (2 ** Math.min(8, reconnectAttempt)));
+      reconnectAttempt += 1;
+      const jitter = Math.floor(delay * (0.5 + Math.random() * 0.5));
+      await sleep(jitter);
+    }
+  };
+
+  loopPromise = loop();
+  loopPromise.catch(() => {});
+
+  return {
+    get lastEventId() { return lastEventId; },
+    get reconnectAttempt() { return reconnectAttempt; },
+    pause() {
+      paused = true;
+      generation += 1;
+      try { activeAbort?.abort(new DOMException('SSE keepalive paused', 'AbortError')); } catch {}
+      clearSilence();
+    },
+    resume() {
+      if (stopped) return;
+      paused = false;
+    },
+    async stop() {
+      stopped = true;
+      paused = false;
+      generation += 1;
+      try { activeAbort?.abort(new DOMException('SSE keepalive stopped', 'AbortError')); } catch {}
+      clearSilence();
+      await loopPromise?.catch(() => {});
+    },
+  };
 }
 
 function abortable(promise, signal, onLateValue) {
@@ -488,14 +617,17 @@ export class HeadlessLocalRuntime {
   constructor({ client, sandboxId, deviceId, conversationId, workspace, permission = DEFAULT_HEADLESS_PERMISSION, callConnector,
     approve, onReady = () => {}, onError = () => {}, requestTimeoutMs = 300_000, toolTimeoutMs = 120_000,
     maxOutputBytes = MAX_RESULT_BYTES, maxToolCalls = MAX_RECORDED_CALLS, journalPath, accountId, initialResponse,
-    transport = 'http-sse', frontierSocket = null } = {}) {
+    transport = 'sse', frontierSocket = null, ownsSocket = true } = {}) {
     if (typeof client?.request !== 'function' || typeof client?.json !== 'function') throw new TypeError('runtime client must provide request() and json()');
     this.client = client;
     this.initialResponse = initialResponse;
-    this.transport = transport === 'frontier-ws' ? 'frontier-ws' : 'http-sse';
-    this.frontierSocket = this.transport === 'frontier-ws' ? frontierSocket : null;
-    if (this.transport === 'frontier-ws' && (!this.frontierSocket || typeof this.frontierSocket.addEventListener !== 'function')) {
-      throw new TypeError('frontier-ws transport requires an open frontierSocket');
+    // Canonical values: ws | sse. Accept legacy frontier-ws → ws.
+    this.transport = (transport === 'ws' || transport === 'frontier-ws') ? 'ws' : 'sse';
+    this.frontierSocket = this.transport === 'ws' ? frontierSocket : null;
+    // Shared ws hubs inject a long-lived command socket; do not close it with the runtime.
+    this.ownsSocket = ownsSocket !== false;
+    if (this.transport === 'ws' && (!this.frontierSocket || typeof this.frontierSocket.addEventListener !== 'function')) {
+      throw new TypeError('ws transport requires an open frontierSocket');
     }
     this.sandboxId = requiredString(sandboxId, 'sandbox id', 256);
     this.deviceId = requiredDeviceId(deviceId);
@@ -557,7 +689,9 @@ export class HeadlessLocalRuntime {
     if (this.state === 'closed') {
       if (!this.controller.signal.aborted) this.controller.abort(reason);
       try { await this.reader?.cancel(reason); } catch {}
-      try { this.frontierSocket?.close?.(); } catch {}
+      if (this.ownsSocket) {
+        try { this.frontierSocket?.close?.(); } catch {}
+      }
       this.frontierSocket = null;
       await this.loopPromise?.catch(() => {});
       this.reader = null;
@@ -570,7 +704,9 @@ export class HeadlessLocalRuntime {
     this.state = 'closing';
     if (!this.controller.signal.aborted) this.controller.abort(reason);
     try { await this.reader?.cancel(reason); } catch {}
-    try { this.frontierSocket?.close?.(); } catch {}
+    if (this.ownsSocket) {
+      try { this.frontierSocket?.close?.(); } catch {}
+    }
     this.frontierSocket = null;
     try { await this.initialResponse?.body?.cancel?.(reason); } catch {}
     this.initialResponse = null;
@@ -744,7 +880,7 @@ export class HeadlessLocalRuntime {
 
   async runLoop() {
     await this.journalReady;
-    if (this.transport === 'frontier-ws') {
+    if (this.transport === 'ws') {
       await this.runFrontierLoop();
       return;
     }
@@ -768,8 +904,8 @@ export class HeadlessLocalRuntime {
         delayMs = 250;
         if (!this.readySettled) {
           this.readySettled = true;
-          this.readyResolve({ ready: true, transport: 'http-sse', sandboxId: this.sandboxId, conversationId: this.conversationId });
-          await this.onReady({ sandboxId: this.sandboxId, conversationId: this.conversationId, transport: 'http-sse' });
+          this.readyResolve({ ready: true, transport: 'sse', sandboxId: this.sandboxId, conversationId: this.conversationId });
+          await this.onReady({ sandboxId: this.sandboxId, conversationId: this.conversationId, transport: 'sse' });
         }
         await this.consume(response);
         if (!this.controller.signal.aborted) throw new Error('Local runtime SSE stream ended');
@@ -807,8 +943,8 @@ export class HeadlessLocalRuntime {
     this.state = 'ready';
     if (!this.readySettled) {
       this.readySettled = true;
-      this.readyResolve({ ready: true, transport: 'frontier-ws', sandboxId: this.sandboxId, conversationId: this.conversationId });
-      await this.onReady({ sandboxId: this.sandboxId, conversationId: this.conversationId, transport: 'frontier-ws' });
+      this.readyResolve({ ready: true, transport: 'ws', sandboxId: this.sandboxId, conversationId: this.conversationId });
+      await this.onReady({ sandboxId: this.sandboxId, conversationId: this.conversationId, transport: 'ws' });
       if (timing) console.error(`[headless-timing] frontier_loop_ready +${Date.now() - loopStarted}ms`);
     }
     const queue = [];
@@ -868,7 +1004,9 @@ export class HeadlessLocalRuntime {
       socket.removeEventListener('message', onMessage);
       socket.removeEventListener('close', onClose);
       socket.removeEventListener('error', onError);
-      try { socket.close?.(); } catch {}
+      if (this.ownsSocket) {
+        try { socket.close?.(); } catch {}
+      }
       if (this.frontierSocket === socket) this.frontierSocket = null;
       if (!this.readySettled && this.controller.signal.aborted) {
         this.readyReject(this.controller.signal.reason || new Error('Local runtime stopped before connecting'));

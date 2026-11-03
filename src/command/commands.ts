@@ -10,6 +10,8 @@ export const commands: readonly CommandDefinition[] = [
   {"path": "usage", "desktop": "[--profile <name>] [--json]", "headless": "[--profile <name>] [--timeout <seconds>] [--json]"},
   {"path": "profiles", "desktop": "[--json]", "headless": "[--json]"},
   {"path": "runtimes", "desktop": "[--json]", "headless": "[--json]"},
+  {"path": "keepalive status", "headless": "[--profile <name>] [--json]"},
+  {"path": "keepalive stop", "headless": "[--profile <name>] [--json]"},
   {"path": "projects list", "desktop": "[--timeout <seconds>] [--json]", "headless": "[--profile <name>] [--timeout <seconds>] [--json]"},
   {"path": "projects create", "desktop": "<name> [--workspace <path>] [--json]", "headless": "<name> [--profile <name>] [--timeout <seconds>] [--json]"},
   {"path": "sessions list", "desktop": "[--all | --limit <count>] [--archived] [--profile <name>] [--timeout <seconds>] [--json]", "headless": "[--all | --limit <count>] [--archived] [--json]"},

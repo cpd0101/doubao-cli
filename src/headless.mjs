@@ -42,6 +42,7 @@ export function validateHeadlessOptions(options) {
   if (options.unknownFlags?.length) throw new Error(`Unknown Headless option: ${options.unknownFlags[0]}; use -- before literal option text`);
   if (options.cookieFile && command !== 'login') throw new Error('--cookie-file requires doubao headless login');
   const supported = ['login', 'logout', 'status', 'capabilities', 'models', 'profiles', 'usage', 'runtimes'].includes(command)
+    || command === 'keepalive' && ['status', 'stop'].includes(subcommand)
     || command === 'sessions' && ['list', 'current', 'open', 'read', 'create', 'send', 'status', 'wait', 'stop', ...SESSION_ACTIONS].includes(subcommand)
     || command === 'automations' && ['list', 'get', 'create', 'update', 'delete'].includes(subcommand)
     || command === 'projects' && ['list', 'create'].includes(subcommand)
@@ -49,6 +50,10 @@ export function validateHeadlessOptions(options) {
     || command === 'model' && (!subcommand || ['current', 'select', 'reasoning'].includes(subcommand));
   if (!supported) throw new Error(`${options.args.slice(0, 2).join(' ')} is not supported on doubao headless`);
   if (['login', 'logout', 'status', 'capabilities', 'models'].includes(command) && options.args.length !== 1) throw new Error(`${command} accepts no positional arguments`);
+  if (command === 'keepalive') {
+    if (!['status', 'stop'].includes(subcommand)) throw new Error('keepalive requires status or stop');
+    if (options.args.length !== 2) throw new Error(`keepalive ${subcommand} accepts no positional arguments`);
+  }
   if (options.reasoning) resolveReasoningEffort(options.reasoning);
   if (options.wait && (command !== 'sessions' || !['create', 'send'].includes(subcommand)
     || !options.args.slice(subcommand === 'create' ? 2 : 3).join(' ').trim())) throw new Error('Headless --wait requires sessions create/send with a message');
@@ -79,148 +84,212 @@ async function signedInClient(timeoutMs, profile) {
   return client;
 }
 
-/** Headless Local command transport. Default Frontier (Desktop-aligned); set `http-sse` to force legacy SSE. */
+/**
+ * Headless Local command transport: `sse` (default, `/chunk_stream`)
+ * or `ws` (Desktop-aligned command websocket). Alias: `frontier-ws`/`frontier` → ws.
+ */
 export function resolveHeadlessLocalTransport(env = process.env) {
-  const raw = String(env?.DOUBAO_HEADLESS_LOCAL_TRANSPORT || 'frontier-ws').trim().toLowerCase();
-  if (raw === 'http-sse' || raw === 'sse') return 'http-sse';
-  return 'frontier-ws';
+  const raw = String(env?.DOUBAO_HEADLESS_LOCAL_TRANSPORT || 'sse').trim().toLowerCase();
+  if (raw === 'ws' || raw === 'frontier-ws' || raw === 'frontier') return 'ws';
+  if (raw === 'sse' || raw === '') return 'sse';
+  return 'sse';
+}
+
+/**
+ * Cross-CLI local keepalive (ws Frontier hub + sse sticky-sandbox hub).
+ * Off via DOUBAO_HEADLESS_FRONTIER_KEEPALIVE=0; unsupported on win32.
+ */
+export function resolveFrontierKeepaliveEnabled(env = process.env) {
+  if (process.platform === 'win32') return false;
+  const raw = String(env?.DOUBAO_HEADLESS_FRONTIER_KEEPALIVE ?? '1').trim().toLowerCase();
+  return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no');
+}
+
+/**
+ * Early STREAM_CHUNKs after REPLYING clears are often just an opening fence
+ * (` ``` `). Treat those as incomplete so we keep the grace window / IM poll.
+ */
+export function isIncompleteEarlyReply(text) {
+  const value = String(text || '').trim();
+  if (!value) return true;
+  const fences = value.match(/```/g);
+  if (fences && fences.length % 2 === 1) return true;
+  return false;
 }
 
 export async function streamCompletion(client, body, {
   timeoutMs, waitForReply = false, onReceipt = () => {}, runId = '', signal,
-  // Desktop/CDP stops the spinner when Frontier agent_task_status settles.
+  // Optional Frontier tracker (diagnostics / legacy). Early-complete uses end_type=1.
   agentStatus = null,
-  // After REPLYING clears, poll IM while keeping the completion stream open briefly
-  // for a late STREAM_CHUNK. Stop as soon as either path has the visible reply.
+  // After end_type=1, briefly allow IM to upgrade a truncated stream answer.
   earlyAnswerGraceMs = 3_000,
+  // Desktop stops its local spinner at SSE end_type=1 (MsgFinish) when it owns the
+  // completion stream. Server is_loading stays 1 until end_type=3; bystander Doubao UI
+  // only clears then. Return to the CLI on end_type=1, and keep draining this SSE in
+  // the keepalive hub until end_type=3 so the server can clear is_loading. drainMs=0
+  // cancels immediately (tests).
+  earlyStreamDrainMs = 120_000,
 } = {}) {
   const state = { conversationId: body.client_meta.conversation_id, runId, localMessageId: body.messages[0].local_message_id,
     answer: '', thinking: '', completed: false, handoffs: [], liveMessages: [], requestBody: body, accepted: false, requestDispatched: false,
-    earlyComplete: null, uiSettled: null };
+    earlyComplete: null, uiSettled: null, streamFinished: null, streamDrain: null };
   const checkpoint = () => onReceipt({ ...state });
-  try {
-    state.requestDispatched = true;
-    const response = await client.request('/chat/completion', { method: 'POST', timeoutMs, ...(signal ? { signal } : {}),
-      headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-    const streamStarted = Date.now();
-    const timing = process.env.DOUBAO_HEADLESS_TIMING === '1';
-    let firstAnswerAt = 0;
-    let earlyWatcher = null;
-    const earlyAbort = new AbortController();
-    // body.cancel() alone can leave consumeSse blocked on reader.read() until the
-    // server closes (~end_type=3). Abort this signal so early-complete returns promptly.
-    const streamStop = new AbortController();
-    const stopEarly = async (reason) => {
-      if (state.earlyComplete) return;
-      state.earlyComplete = reason || 'agent_task_status';
-      state.completed = true;
-      if (timing) {
-        console.error(`[headless-timing] completion_early_complete +${Date.now() - streamStarted}ms reason=${state.earlyComplete} answer=${JSON.stringify(String(state.answer || '').slice(0, 40))}`);
-      }
-      try { streamStop.abort(new DOMException('Early complete', 'AbortError')); } catch {}
-      try { await response.body?.cancel?.(); } catch {}
-    };
-    const onUiSettled = async (reason) => {
-      if (state.earlyComplete || state.uiSettled) return;
-      state.uiSettled = reason || 'agent_task_status';
-      if (timing) console.error(`[headless-timing] completion_ui_settled +${Date.now() - streamStarted}ms reason=${state.uiSettled}`);
-      if (String(state.answer || '').trim()) {
-        await stopEarly(state.uiSettled);
-        return;
-      }
-      const waitMs = Math.max(0, Number(earlyAnswerGraceMs) || 0);
-      const imDeadline = Date.now() + waitMs;
-      while (!state.earlyComplete && !String(state.answer || '').trim() && Date.now() < imDeadline) {
-        if (!state.conversationId) break;
-        const snapshot = await readTurn(client, state.conversationId, {
-          runId: state.runId || runId, localMessageId: state.localMessageId,
-          deadline: imDeadline,
-        }).catch(() => null);
-        const text = String(snapshot?.result?.reply?.text || snapshot?.result?.progress || '').trim();
-        if (text) {
-          state.answer = text;
-          if (timing) console.error(`[headless-timing] completion_im_answer +${Date.now() - streamStarted}ms chars=${text.length}`);
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-      await stopEarly(state.uiSettled);
-    };
-    const linkSignals = (...signals) => {
-      const active = signals.filter(Boolean);
-      if (!active.length) return undefined;
-      if (typeof AbortSignal.any === 'function') return AbortSignal.any(active);
-      const merged = new AbortController();
-      for (const item of active) {
-        if (item.aborted) { merged.abort(item.reason); break; }
-        item.addEventListener('abort', () => merged.abort(item.reason), { once: true });
-      }
-      return merged.signal;
-    };
+  let signalReady;
+  const ready = new Promise(resolve => { signalReady = resolve; });
+  const markReady = () => {
+    try { signalReady?.(state); } catch {}
+    signalReady = null;
+  };
+
+  const work = (async () => {
     try {
-      await consumeSse(response, async (event, data) => {
-        if (state.earlyComplete) return 'stop';
-        if (event === 'SSE_ACK') {
-          const id = String(data?.ack_client_meta?.conversation_id || '');
-          const acceptedRun = String(data?.query_list?.[0]?.question_id || '');
-          const acceptedLocalId = data?.query_list?.[0]?.local_message_id;
-          if (!ID.test(id) || !ID.test(acceptedRun) || state.conversationId && id !== state.conversationId
-            || acceptedLocalId && acceptedLocalId !== state.localMessageId
-            || runId && runId !== acceptedRun) throw new Error('Doubao returned a mismatched acceptance receipt');
-          state.accepted = true;
-          state.conversationId = id;
-          if (timing) console.error(`[headless-timing] completion_ack +${Date.now() - streamStarted}ms`);
-          if (!earlyWatcher && agentStatus && typeof agentStatus.waitUntilSettled === 'function' && waitForReply) {
-            earlyWatcher = agentStatus.waitUntilSettled(id, {
-              signal: linkSignals(signal, earlyAbort.signal),
-              timeoutMs: Math.max(1, timeoutMs - (Date.now() - streamStarted)),
-            }).then((result) => onUiSettled(result?.reason || 'agent_task_status')).catch(() => {});
+      state.requestDispatched = true;
+      const response = await client.request('/chat/completion', { method: 'POST', timeoutMs, ...(signal ? { signal } : {}),
+        headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      const streamStarted = Date.now();
+      const timing = process.env.DOUBAO_HEADLESS_TIMING === '1';
+      let firstAnswerAt = 0;
+      let drainTimer = null;
+      // body.cancel() alone can leave consumeSse blocked on reader.read() until the
+      // server closes (~end_type=3). Abort this signal so the drain window can end.
+      const streamStop = new AbortController();
+      const forceCloseStream = async (reason) => {
+        try { streamStop.abort(new DOMException(reason || 'Early complete', 'AbortError')); } catch {}
+        try { await response.body?.cancel?.(); } catch {}
+      };
+      const armStreamDrain = () => {
+        const drainMs = Math.max(0, Number(earlyStreamDrainMs) || 0);
+        if (drainMs <= 0) {
+          void forceCloseStream('Early complete');
+          return;
+        }
+        if (drainTimer) return;
+        drainTimer = setTimeout(() => {
+          state.streamFinished = state.streamFinished || 'drain_timeout';
+          if (timing) {
+            console.error(`[headless-timing] completion_stream_drain_timeout +${Date.now() - streamStarted}ms`);
           }
+          void forceCloseStream('Early stream drain timeout');
+        }, drainMs);
+        // Do not unref: the keepalive hub must stay alive until drain finishes after
+        // the CLI RPC returns, otherwise end_type=3 never arrives and the UI spins.
+      };
+      const stopEarly = async (reason) => {
+        if (state.earlyComplete) return;
+        state.earlyComplete = reason || 'end_type_1';
+        state.completed = true;
+        if (timing) {
+          console.error(`[headless-timing] completion_early_complete +${Date.now() - streamStarted}ms reason=${state.earlyComplete} answer=${JSON.stringify(String(state.answer || '').slice(0, 40))}`);
         }
-        if (timing && event === 'FETCH_STREAM') {
-          console.error(`[headless-timing] completion_fetch_stream +${Date.now() - streamStarted}ms type=${data?.fetch_type} key=${data?.fetch_key || ''}`);
+        // Keep reading until end_type=3 so the server can clear conversation is_loading.
+        armStreamDrain();
+        markReady();
+      };
+      const upgradeAnswerFromIm = async () => {
+        const waitMs = Math.max(0, Number(earlyAnswerGraceMs) || 0);
+        if (!waitMs || !state.conversationId) return;
+        const imDeadline = Date.now() + waitMs;
+        // end_type=1 brief is sometimes a placeholder like "[代码]" while IM already
+        // has the full reply — always prefer a longer IM/stream snapshot.
+        while (Date.now() < imDeadline) {
+          const snapshot = await readTurn(client, state.conversationId, {
+            runId: state.runId || runId, localMessageId: state.localMessageId,
+            deadline: imDeadline,
+          }).catch(() => null);
+          const text = String(snapshot?.result?.reply?.text || snapshot?.result?.progress || '').trim();
+          if (text && text.length > String(state.answer || '').trim().length) {
+            state.answer = text;
+            if (timing) console.error(`[headless-timing] completion_im_answer +${Date.now() - streamStarted}ms chars=${text.length}`);
+          }
+          const current = String(state.answer || '').trim();
+          if (current && !isIncompleteEarlyReply(current) && !/^\[[^\]]{1,12}\]$/u.test(current)) return;
+          await new Promise(resolve => setTimeout(resolve, 100));
         }
-        if (timing && event === 'SSE_REPLY_END') {
-          console.error(`[headless-timing] completion_reply_end +${Date.now() - streamStarted}ms end_type=${data?.end_type} brief=${JSON.stringify(String(data?.msg_finish_attr?.brief || '').slice(0, 40))}`);
-        }
-        // A Work ACK can precede provisioning its asynchronous task. Keep the
-        // initial stream until a handoff or terminal event even without --wait.
-        const beforeAnswer = state.answer;
-        const result = reduceStreamEvent(state, event, data, { waitForReply: waitForReply || body.option.agent_mode === 1 });
-        if (timing && !firstAnswerAt && state.answer && state.answer !== beforeAnswer) {
-          firstAnswerAt = Date.now();
-          console.error(`[headless-timing] completion_first_answer +${firstAnswerAt - streamStarted}ms text=${JSON.stringify(state.answer.slice(0, 40))}`);
-        }
-        if (state.uiSettled && String(state.answer || '').trim()) {
-          void stopEarly(state.uiSettled);
-          return 'stop';
-        }
-        const pending = updateLiveControls(state, event, data);
-        if (event === 'SSE_ACK' || event === 'FETCH_STREAM' || pending) checkpoint();
-        if (event === 'STREAM_ERROR' || event === 'gateway-error') throw Object.assign(new Error('Doubao completion failed'), { code: 'stream_error' });
-        if (event === 'SSE_ACK' && body.option.general_task_param.runtime_type === 2 && !waitForReply) return 'stop';
-        if (state.earlyComplete) return 'stop';
-        return result || (pending || state.accepted && state.handoffs.length ? 'stop' : undefined);
-      }, { signal: streamStop.signal });
-    } finally {
-      earlyAbort.abort();
-      await earlyWatcher;
+      };
+      try {
+        await consumeSse(response, async (event, data) => {
+          if (timing && event === 'FETCH_STREAM') {
+            console.error(`[headless-timing] completion_fetch_stream +${Date.now() - streamStarted}ms type=${data?.fetch_type} key=${data?.fetch_key || ''}`);
+          }
+          if (timing && event === 'SSE_REPLY_END') {
+            console.error(`[headless-timing] completion_reply_end +${Date.now() - streamStarted}ms end_type=${data?.end_type} brief=${JSON.stringify(String(data?.msg_finish_attr?.brief || '').slice(0, 40))}`);
+          }
+          if (state.earlyComplete) {
+            if (timing && event !== 'SSE_REPLY_END') {
+              console.error(`[headless-timing] completion_drain_event +${Date.now() - streamStarted}ms event=${event}`);
+            }
+            if (event === 'SSE_REPLY_END' && Number(data?.end_type) === 3) {
+              state.streamFinished = 'end_type_3';
+              if (drainTimer) clearTimeout(drainTimer);
+              drainTimer = null;
+              if (timing) console.error(`[headless-timing] completion_stream_drained +${Date.now() - streamStarted}ms`);
+              try { streamStop.abort(new DOMException('Completion finished', 'AbortError')); } catch {}
+              return 'stop';
+            }
+            return undefined;
+          }
+          if (event === 'SSE_ACK') {
+            const id = String(data?.ack_client_meta?.conversation_id || '');
+            const acceptedRun = String(data?.query_list?.[0]?.question_id || '');
+            const acceptedLocalId = data?.query_list?.[0]?.local_message_id;
+            if (!ID.test(id) || !ID.test(acceptedRun) || state.conversationId && id !== state.conversationId
+              || acceptedLocalId && acceptedLocalId !== state.localMessageId
+              || runId && runId !== acceptedRun) throw new Error('Doubao returned a mismatched acceptance receipt');
+            state.accepted = true;
+            state.conversationId = id;
+            if (timing) console.error(`[headless-timing] completion_ack +${Date.now() - streamStarted}ms`);
+          }
+          // A Work ACK can precede provisioning its asynchronous task. Keep the
+          // initial stream until a handoff or terminal event even without --wait.
+          const beforeAnswer = state.answer;
+          const result = reduceStreamEvent(state, event, data, { waitForReply: waitForReply || body.option.agent_mode === 1 });
+          if (timing && !firstAnswerAt && state.answer && state.answer !== beforeAnswer) {
+            firstAnswerAt = Date.now();
+            console.error(`[headless-timing] completion_first_answer +${firstAnswerAt - streamStarted}ms text=${JSON.stringify(state.answer.slice(0, 40))}`);
+          }
+          // Desktop MsgFinish (end_type=1): CLI can return; keep SSE open until ReplyFinish (3).
+          if (event === 'SSE_REPLY_END' && Number(data?.end_type) === 1 && waitForReply) {
+            void (async () => {
+              await upgradeAnswerFromIm();
+              if (String(state.answer || '').trim()) await stopEarly('end_type_1');
+            })();
+            return undefined;
+          }
+          const pending = updateLiveControls(state, event, data);
+          if (event === 'SSE_ACK' || event === 'FETCH_STREAM' || pending) checkpoint();
+          if (event === 'STREAM_ERROR' || event === 'gateway-error') throw Object.assign(new Error('Doubao completion failed'), { code: 'stream_error' });
+          if (event === 'SSE_ACK' && body.option.general_task_param.runtime_type === 2 && !waitForReply) return 'stop';
+          return result || (pending || state.accepted && state.handoffs.length ? 'stop' : undefined);
+        }, { signal: streamStop.signal });
+      } finally {
+        if (drainTimer) clearTimeout(drainTimer);
+        markReady();
+      }
+      if (timing) console.error(`[headless-timing] completion_stream_done +${Date.now() - streamStarted}ms answer=${JSON.stringify(state.answer.slice(0, 40))} handoffs=${state.handoffs.length} completed=${state.completed} early=${state.earlyComplete || ''} finished=${state.streamFinished || ''}`);
+      if (!state.accepted) throw new Error('Completion ended without a verified acceptance receipt');
+      checkpoint();
+      return state;
+    } catch (error) {
+      // A failed receipt write must not erase the server's accepted IDs.
+      try { checkpoint(); } catch {}
+      markReady();
+      if (typeof error.code !== 'string') error = Object.assign(new Error(error.message, { cause: error }), {
+        name: error.name, code: ['TimeoutError', 'AbortError'].includes(error.name) ? 'timeout' : 'request_failed',
+      });
+      error.result = { platform: 'headless', conversationId: state.conversationId || null, runId: state.runId || null,
+        localMessageId: state.localMessageId, accepted: state.accepted, requestDispatched: state.requestDispatched, status: state.failed ? 'failed' : 'unknown', reply: null,
+        recovery: state.accepted ? 'Use sessions wait with the same conversationId and runId; do not resend' : 'Acceptance is unknown; inspect session history before retrying' };
+      throw error;
     }
-    if (timing) console.error(`[headless-timing] completion_stream_done +${Date.now() - streamStarted}ms answer=${JSON.stringify(state.answer.slice(0, 40))} handoffs=${state.handoffs.length} completed=${state.completed} early=${state.earlyComplete || ''}`);
-    if (!state.accepted) throw new Error('Completion ended without a verified acceptance receipt');
-    checkpoint();
-    return state;
-  } catch (error) {
-    // A failed receipt write must not erase the server's accepted IDs.
-    try { checkpoint(); } catch {}
-    if (typeof error.code !== 'string') error = Object.assign(new Error(error.message, { cause: error }), {
-      name: error.name, code: ['TimeoutError', 'AbortError'].includes(error.name) ? 'timeout' : 'request_failed',
-    });
-    error.result = { platform: 'headless', conversationId: state.conversationId || null, runId: state.runId || null,
-      localMessageId: state.localMessageId, accepted: state.accepted, requestDispatched: state.requestDispatched, status: state.failed ? 'failed' : 'unknown', reply: null,
-      recovery: state.accepted ? 'Use sessions wait with the same conversationId and runId; do not resend' : 'Acceptance is unknown; inspect session history before retrying' };
-    throw error;
-  }
+  })();
+
+  state.streamDrain = work;
+  await Promise.race([ready, work]);
+  const detach = Boolean(state.earlyComplete) && Math.max(0, Number(earlyStreamDrainMs) || 0) > 0;
+  if (!detach) return work;
+  if (!state.accepted) return work;
+  checkpoint();
+  return state;
 }
 
 function attachLifecycle(client) {
@@ -339,10 +408,30 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
   if (command === 'capabilities') return { platform: 'headless', browserRequired: false, appRequired: false,
     login: ['terminal-qr', 'cookie-file'], sessions: ['list', 'current', 'open', 'read', 'create', 'send', 'status', 'wait', 'stop', ...SESSION_ACTIONS],
     runtime: ['cloud', 'local'], models: true, modelSelection: true, reasoning: true, profiles: true, usage: true,
+    keepalive: ['status', 'stop'],
     goalMode: { supported: true, minimumVersion: GOAL_MIN_VERSION, protocolVersion: HEADLESS_PROTOCOL_VERSION, accountGate: 'goal_mode_enable' },
     automations: ['list', 'get', 'create', 'update', 'delete'],
     attachments: true, localRuntime: true, mcp: true, projects: true, enterpriseKnowledgeSelection: true,
     note: 'open/current select the CLI conversation; model defaults are scoped to the profile and account' };
+  if (command === 'keepalive') {
+    const transport = resolveHeadlessLocalTransport();
+    if (transport === 'sse') {
+      const { inspectSseHub, stopSseHub } = await import('./headless-sse-hub.mjs');
+      if (subcommand === 'status') {
+        const hub = await inspectSseHub({ profile, configDir: configDirectory() });
+        return { platform: 'headless', profile, transport: 'sse', keepalive: hub };
+      }
+      const stopped = await stopSseHub({ profile, configDir: configDirectory() });
+      return { platform: 'headless', ...stopped };
+    }
+    const { inspectFrontierHub, stopFrontierHub } = await import('./headless-frontier-hub.mjs');
+    if (subcommand === 'status') {
+      const hub = await inspectFrontierHub({ profile, configDir: configDirectory() });
+      return { platform: 'headless', profile, transport: 'ws', keepalive: hub };
+    }
+    const stopped = await stopFrontierHub({ profile, configDir: configDirectory() });
+    return { platform: 'headless', ...stopped };
+  }
   if (command === 'profiles') {
     return { platform: 'headless', ...await listHeadlessProfileMetadata({ timeoutMs: remaining() }) };
   }
@@ -387,7 +476,7 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
   if (command === 'runtimes') return { platform: 'headless', profile, runtimes: [
     { id: 'cloud', name: '云端', available: true },
     { id: 'local', name: '本地电脑', available: true, deviceId: client.device.device_id, deviceName: os.hostname(),
-      engine: resolveHeadlessLocalTransport() === 'frontier-ws' ? 'node-frontier-ws' : 'node-http-sse',
+      engine: resolveHeadlessLocalTransport() === 'ws' ? 'node-ws' : 'node-sse',
       hostPlatform: process.platform },
   ] };
   if (command === 'mcp') {
@@ -499,16 +588,75 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
       catch (error) { throw acceptedLocalFailure(error, accepted); }
       return accepted;
     }
-    let localTaskParam, localRuntime, connectors, enginePromise, localChannel, localChannelAbort, frontierSocket, frontierAgentStatus;
     const localTransport = resolveHeadlessLocalTransport();
+    // Cross-CLI keepalive: RPC into the profile hub instead of open/close per process.
+    // ws → Frontier hub (shared command websocket); sse → sticky-sandbox hub.
+    if (runtimeChoice === 'local' && resolveFrontierKeepaliveEnabled()
+      && !options.frontierHubServer && !options.sseHubServer
+      && (options.wait || options.backgroundWorker)) {
+      if (options.workspace && !(await fs.stat(resolved.workspace)).isDirectory()) {
+        throw new Error(`workspace is not a directory: ${resolved.workspace}`);
+      }
+      await fs.mkdir(resolved.workspace, { recursive: true });
+      const hubOptions = {
+        ...options,
+        runtime: 'local',
+        workspace: resolved.workspace,
+        permission: localPermission,
+        project: taskContext.projectId || options.project || 'none',
+        wait: true,
+        backgroundWorker: true,
+        // Drop non-JSON callbacks before the hub RPC boundary.
+        onAccepted: undefined,
+        frontierHubServer: undefined,
+        sseHubServer: undefined,
+      };
+      if (localTransport === 'sse') {
+        const { callSseHubTurn } = await import('./headless-sse-hub.mjs');
+        return callSseHubTurn({
+          profile,
+          configDir: configDirectory(),
+          options: hubOptions,
+          fullAccessConfirmed,
+          expectedAccountId: client.accountId,
+          timeoutMs: remaining(),
+          onAccepted: typeof options.onAccepted === 'function' ? options.onAccepted : undefined,
+        });
+      }
+      if (localTransport === 'ws') {
+        const { callFrontierHubTurn } = await import('./headless-frontier-hub.mjs');
+        return callFrontierHubTurn({
+          profile,
+          configDir: configDirectory(),
+          options: hubOptions,
+          fullAccessConfirmed,
+          expectedAccountId: client.accountId,
+          timeoutMs: remaining(),
+          onAccepted: typeof options.onAccepted === 'function' ? options.onAccepted : undefined,
+        });
+      }
+    }
+    let localTaskParam, localRuntime, connectors, enginePromise, localChannel, localChannelAbort, frontierSocket, frontierAgentStatus;
+    let ownsFrontierSocket = true;
     try {
       if (runtimeChoice === 'local') {
         const localProject = taskContext.projectContext;
         const workspace = resolved.workspace;
         if (options.workspace && !(await fs.stat(workspace)).isDirectory()) throw new Error(`workspace is not a directory: ${workspace}`);
         await fs.mkdir(workspace, { recursive: true });
-        const sandboxId = `cli-${randomUUID()}`;
-        const local = buildHeadlessLocalTaskParam({ workspace, sandboxId, deviceId: client.device.device_id, permission: localPermission });
+        let sandboxId = `cli-${randomUUID()}`;
+        let deviceId = client.device.device_id;
+        if (options.sseHubServer && localTransport === 'sse') {
+          const hub = await import('./headless-sse-hub.mjs');
+          const sticky = hub.getBoundHubSandboxId();
+          const boundDevice = hub.getBoundHubDeviceId();
+          if (!sticky) {
+            throw Object.assign(new Error('SSE hub has no sticky sandbox id'), { code: 'SSE_HUB_SANDBOX_MISSING' });
+          }
+          sandboxId = sticky;
+          if (boundDevice) deviceId = boundDevice;
+        }
+        const local = buildHeadlessLocalTaskParam({ workspace, sandboxId, deviceId, permission: localPermission });
         localTaskParam = JSON.parse(local.general_task_param);
         Object.assign(localTaskParam.agent_task_param, { device_name: os.hostname(), folder_name: path.basename(workspace), local_app_id: '1044603' });
         const localInput = JSON.parse(localTaskParam.task_input_json);
@@ -527,8 +675,10 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
         await fs.mkdir(profileDirectory, { recursive: true, mode: 0o700 });
         const journalDirectory = path.join(await fs.realpath(profileDirectory), 'runtime', createHash('sha256').update(client.accountId).digest('hex'));
         await fs.mkdir(journalDirectory, { recursive: true, mode: 0o700 });
-        localRuntime = { workspace, sandboxId, deviceId: client.device.device_id, permission: localPermission,
-          connectorIds: options.mcps || [], journalPath: path.join(journalDirectory, sandboxId + '.json') };
+        // Sticky SSE-hub sandboxes span conversations; journal files stay per-turn.
+        const journalKey = options.sseHubServer ? `${sandboxId}.${randomUUID()}` : sandboxId;
+        localRuntime = { workspace, sandboxId, deviceId, permission: localPermission,
+          connectorIds: options.mcps || [], journalPath: path.join(journalDirectory, journalKey + '.json') };
       }
       const attachmentBlocks = options.attachments?.length
         ? await uploadHeadlessAttachments(client, await resolveAttachmentFiles(options.attachments), remaining()) : [];
@@ -537,16 +687,31 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
       // miss the initial workspace command on a device without a native app.
       if (localRuntime) {
         localChannelAbort = new AbortController();
-        if (localTransport === 'frontier-ws') {
-          const { connectFrontierCommandChannel } = await import('./headless-frontier-ws.mjs');
-          const channel = await connectFrontierCommandChannel(client, {
-            deviceId: localRuntime.deviceId, timeoutMs: Math.min(15_000, remaining()),
-          });
-          frontierSocket = channel.socket;
-          frontierAgentStatus = channel.agentStatus;
+        if (localTransport === 'ws') {
+          if (options.frontierHubServer) {
+            const hub = await import('./headless-frontier-hub.mjs');
+            const { attachAgentTaskStatusTracker } = await import('./headless-frontier-ws.mjs');
+            frontierSocket = hub.getBoundHubFrontierSocket();
+            if (!frontierSocket || typeof frontierSocket.addEventListener !== 'function') {
+              throw Object.assign(new Error('Frontier hub has no open command websocket'), { code: 'FRONTIER_HUB_SOCKET_MISSING' });
+            }
+            // Per-turn tracker: reusing a settled tracker falsely early-completes.
+            frontierAgentStatus = attachAgentTaskStatusTracker(frontierSocket);
+            ownsFrontierSocket = false;
+            const boundDevice = hub.getBoundHubDeviceId();
+            if (boundDevice) localRuntime.deviceId = boundDevice;
+          } else {
+            const { connectFrontierCommandChannel } = await import('./headless-frontier-ws.mjs');
+            const channel = await connectFrontierCommandChannel(client, {
+              deviceId: localRuntime.deviceId, timeoutMs: Math.min(15_000, remaining()),
+            });
+            frontierSocket = channel.socket;
+            frontierAgentStatus = channel.agentStatus;
+          }
         } else {
           // Frontier probes may have registered enable_ws_multi_env=1 for this device;
           // that routes commands away from legacy SSE. Clear before subscribing.
+          // SSE hub already cleared at process start; still re-assert for safety.
           const { clearMultiEnvDevice } = await import('./headless-frontier-ws.mjs');
           await clearMultiEnvDevice(client, { timeoutMs: Math.min(15_000, remaining()) }).catch(() => {});
           // Some servers flush SSE headers only after the first task command.
@@ -561,11 +726,12 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
       let reportedAcceptance = false;
       const startEngine = (initialResponse) => startLocalRuntime(client, profile, receipt, connectors, remaining(), initialResponse, localChannelAbort?.signal, {
         autoApprove: options.yes === true, transport: localTransport, frontierSocket,
+        ownsSocket: ownsFrontierSocket,
       });
       const checkpoint = next => {
         Object.assign(receipt, next); store.save(receipt);
         if (localRuntime && options.wait && receipt.accepted && receipt.conversationId && !enginePromise) {
-          if (localTransport === 'frontier-ws') {
+          if (localTransport === 'ws') {
             enginePromise = startEngine(undefined);
           } else {
             const initialResponse = localChannel;
@@ -584,7 +750,7 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
       try {
         accepted = await streamCompletion(client, body, {
           timeoutMs: remaining(), waitForReply: options.wait, onReceipt: checkpoint,
-          agentStatus: localTransport === 'frontier-ws' && options.wait ? frontierAgentStatus : null,
+          agentStatus: localTransport === 'ws' && options.wait ? frontierAgentStatus : null,
         });
       } catch (error) {
         submissionError = error;
@@ -631,21 +797,24 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
           localMessageId: receipt.localMessageId, status: 'running', accepted: true, reply: null };
       }
       try {
-        // Align with Desktop/CDP: once Frontier clears agent_task_status, stop waiting on
-        // the late HTTP completion end_type=3 and return the visible reply (stream or IM).
-        // Never fall through to waitTurn after early-complete — that reintroduces the spinner.
-        if (accepted.earlyComplete === 'agent_task_status' && receipt.conversationId && receipt.runId) {
+        // Align with Desktop MsgFinish: return on end_type=1 (or legacy settle reasons)
+        // while the hub keeps draining the same SSE until end_type=3.
+        if (['end_type_1', 'is_loading', 'agent_task_status'].includes(accepted.earlyComplete)
+          && receipt.conversationId && receipt.runId) {
           if (localRuntime) enginePromise ||= startEngine(undefined);
           if (enginePromise) await enginePromise.catch(() => null);
           let text = String(accepted.answer || '').trim();
           const timing = process.env.DOUBAO_HEADLESS_TIMING === '1';
           const imStarted = Date.now();
-          for (let attempt = 0; !text && attempt < 8; attempt += 1) {
+          // Upgrade truncated stream answers (opening ``` only) from IM.
+          for (let attempt = 0; attempt < 8; attempt += 1) {
+            if (text && !isIncompleteEarlyReply(text)) break;
             if (attempt) await new Promise(resolve => setTimeout(resolve, 150));
             const snapshot = await readTurn(client, receipt.conversationId, {
               runId: receipt.runId, receipt, deadline,
             }).catch(() => null);
-            text = String(snapshot?.result?.reply?.text || snapshot?.result?.progress || '').trim();
+            const im = String(snapshot?.result?.reply?.text || snapshot?.result?.progress || '').trim();
+            if (im && im.length > text.length) text = im;
           }
           if (timing) {
             console.error(`[headless-timing] early_reply_resolved +${Date.now() - imStarted}ms chars=${text.length}`);
@@ -658,7 +827,7 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
             conversationId: receipt.conversationId, runId: receipt.runId, localMessageId: receipt.localMessageId,
             status: 'completed',
             reply: text ? { role: 'assistant', text } : null,
-            completion: 'agent_task_status',
+            completion: accepted.earlyComplete || 'is_loading',
           };
         }
         const wait = signal => waitTurn(client, receipt.conversationId, { runId: receipt.runId, receipt, deadline, signal,
@@ -673,7 +842,9 @@ export async function executeHeadless(options, { confirmFullAccess = confirmHead
       localChannelAbort?.abort();
       await localChannel?.then(response => response.body?.cancel()).catch(() => {});
       try { frontierAgentStatus?.detach?.(); } catch {}
-      try { frontierSocket?.close?.(); } catch {}
+      if (ownsFrontierSocket) {
+        try { frontierSocket?.close?.(); } catch {}
+      }
       // Local tool frames can still arrive after REPLYING clears; don't block the
       // user-visible completion on draining the Frontier loop.
       if (enginePromise) {
@@ -717,7 +888,7 @@ function acceptedLocalFailure(error, receipt) {
 }
 
 async function startLocalRuntime(client, profile, receipt, connectors, timeoutMs, initialResponse, signal, {
-  autoApprove = false, transport = 'http-sse', frontierSocket = null,
+  autoApprove = false, transport = 'sse', frontierSocket = null, ownsSocket = true,
 } = {}) {
   const spec = receipt.localRuntime;
   // Memory-only authentication creates fresh device metadata per CLI process.
@@ -729,7 +900,7 @@ async function startLocalRuntime(client, profile, receipt, connectors, timeoutMs
       interactive: Boolean(process.stdin.isTTY && process.stderr.isTTY), workspace: spec.workspace });
   const engine = new HeadlessLocalRuntime({ client, ...spec, accountId: client.accountId, conversationId: receipt.conversationId,
     requestTimeoutMs: timeoutMs, initialResponse, callConnector: connectors ? input => connectors.call(input) : undefined,
-    approve, transport, frontierSocket });
+    approve, transport, frontierSocket, ownsSocket });
   try { await engine.start({ signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, timeoutMs))]) : AbortSignal.timeout(Math.max(1, timeoutMs)) }); return engine; }
   catch (error) { await engine.close(); if (error.code === 'LOCAL_RUNTIME_BUSY') return null; throw error; }
 }

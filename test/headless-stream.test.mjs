@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { completionBody, resolveHeadlessLocalTransport, streamCompletion } from '../src/headless.mjs';
+import {
+  completionBody, isIncompleteEarlyReply, resolveFrontierKeepaliveEnabled,
+  resolveHeadlessLocalTransport, streamCompletion,
+} from '../src/headless.mjs';
 
 const conversationId = '38439138239851266', runId = '38439138239851267';
 const ack = { ack_client_meta: { conversation_id: conversationId }, query_list: [{ question_id: runId }] };
@@ -33,41 +36,34 @@ test('native timeout exceptions become recoverable errors without writing readon
   });
 });
 
-test('local transport defaults to frontier-ws and accepts http-sse override', () => {
-  assert.equal(resolveHeadlessLocalTransport({}), 'frontier-ws');
-  assert.equal(resolveHeadlessLocalTransport({ DOUBAO_HEADLESS_LOCAL_TRANSPORT: '' }), 'frontier-ws');
-  assert.equal(resolveHeadlessLocalTransport({ DOUBAO_HEADLESS_LOCAL_TRANSPORT: 'frontier-ws' }), 'frontier-ws');
-  assert.equal(resolveHeadlessLocalTransport({ DOUBAO_HEADLESS_LOCAL_TRANSPORT: 'http-sse' }), 'http-sse');
-  assert.equal(resolveHeadlessLocalTransport({ DOUBAO_HEADLESS_LOCAL_TRANSPORT: 'SSE' }), 'http-sse');
+test('local transport defaults to sse and accepts ws override', () => {
+  assert.equal(resolveHeadlessLocalTransport({}), 'sse');
+  assert.equal(resolveHeadlessLocalTransport({ DOUBAO_HEADLESS_LOCAL_TRANSPORT: '' }), 'sse');
+  assert.equal(resolveHeadlessLocalTransport({ DOUBAO_HEADLESS_LOCAL_TRANSPORT: 'sse' }), 'sse');
+  assert.equal(resolveHeadlessLocalTransport({ DOUBAO_HEADLESS_LOCAL_TRANSPORT: 'SSE' }), 'sse');
+  assert.equal(resolveHeadlessLocalTransport({ DOUBAO_HEADLESS_LOCAL_TRANSPORT: 'ws' }), 'ws');
+  assert.equal(resolveHeadlessLocalTransport({ DOUBAO_HEADLESS_LOCAL_TRANSPORT: 'frontier-ws' }), 'ws');
 });
 
-test('agent_task_status early-complete unblocks a hung completion body promptly', async () => {
-  const hanging = new Response(new ReadableStream({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode(`event: SSE_ACK\ndata: ${JSON.stringify(ack)}\n\n`));
-      // Leave the stream open so reader.read() would otherwise wait for end_type=3.
-    },
-  }), { headers: { 'content-type': 'text/event-stream' } });
-  const agentStatus = {
-    waitUntilSettled: async () => {
-      await new Promise(resolve => setTimeout(resolve, 20));
-      return { reason: 'agent_task_status' };
-    },
-  };
-  const started = Date.now();
-  const result = await streamCompletion(
-    { request: async () => hanging },
-    completionBody({ message: 'fixture', mode: 'chat' }),
-    { timeoutMs: 5000, waitForReply: true, agentStatus, earlyAnswerGraceMs: 0 },
-  );
-  const elapsed = Date.now() - started;
-  assert.equal(result.accepted, true);
-  assert.equal(result.earlyComplete, 'agent_task_status');
-  assert.equal(result.conversationId, conversationId);
-  assert.ok(elapsed < 1000, `early-complete should finish quickly, took ${elapsed}ms`);
+test('frontier keepalive defaults on outside win32 and accepts explicit disable', () => {
+  if (process.platform === 'win32') {
+    assert.equal(resolveFrontierKeepaliveEnabled({}), false);
+    return;
+  }
+  assert.equal(resolveFrontierKeepaliveEnabled({}), true);
+  assert.equal(resolveFrontierKeepaliveEnabled({ DOUBAO_HEADLESS_FRONTIER_KEEPALIVE: '0' }), false);
+  assert.equal(resolveFrontierKeepaliveEnabled({ DOUBAO_HEADLESS_FRONTIER_KEEPALIVE: 'off' }), false);
 });
 
-test('ui settle keeps the stream until the visible answer arrives', async () => {
+test('incomplete early replies include empty text and unclosed fences', () => {
+  assert.equal(isIncompleteEarlyReply(''), true);
+  assert.equal(isIncompleteEarlyReply('```'), true);
+  assert.equal(isIncompleteEarlyReply('```\n'), true);
+  assert.equal(isIncompleteEarlyReply('```\ntotal 0\n```'), false);
+  assert.equal(isIncompleteEarlyReply('VISIBLE'), false);
+});
+
+test('end_type=1 early-complete upgrades an incomplete fence via later stream chunks', async () => {
   let push;
   const stream = new ReadableStream({
     start(controller) {
@@ -75,24 +71,78 @@ test('ui settle keeps the stream until the visible answer arrives', async () => 
       push(`event: SSE_ACK\ndata: ${JSON.stringify(ack)}\n\n`);
     },
   });
-  const agentStatus = {
-    waitUntilSettled: async () => {
-      await new Promise(resolve => setTimeout(resolve, 20));
-      return { reason: 'agent_task_status' };
-    },
+  const client = {
+    request: async () => new Response(stream, { headers: { 'content-type': 'text/event-stream' } }),
   };
-  const pending = streamCompletion(
-    { request: async () => new Response(stream, { headers: { 'content-type': 'text/event-stream' } }) },
-    completionBody({ message: 'fixture', mode: 'chat' }),
-    { timeoutMs: 5000, waitForReply: true, agentStatus, earlyAnswerGraceMs: 2_000 },
-  );
+  const pending = streamCompletion(client, completionBody({ message: 'fixture', mode: 'chat' }), {
+    timeoutMs: 5000, waitForReply: true, earlyAnswerGraceMs: 1_500, earlyStreamDrainMs: 0,
+  });
   await new Promise(resolve => setTimeout(resolve, 40));
   push(`event: STREAM_CHUNK\ndata: ${JSON.stringify({
     patch_op: [{ patch_value: { content_block: [
-      { block_type: 10000, content: { text_block: { text: 'VISIBLE' } } },
+      { block_type: 10000, content: { text_block: { text: '```' } } },
     ] } }],
   })}\n\n`);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  push(`event: STREAM_CHUNK\ndata: ${JSON.stringify({
+    patch_op: [{ patch_value: { content_block: [
+      { block_type: 10000, content: { text_block: { text: '\ntotal 0\n```' } } },
+    ] } }],
+  })}\n\n`);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  push(`event: SSE_REPLY_END\ndata: ${JSON.stringify({ end_type: 1, msg_finish_attr: { brief: '```\ntotal 0\n```' } })}\n\n`);
   const result = await pending;
-  assert.equal(result.earlyComplete, 'agent_task_status');
+  assert.equal(result.earlyComplete, 'end_type_1');
+  assert.match(result.answer, /total 0/u);
+  assert.equal(isIncompleteEarlyReply(result.answer), false);
+});
+
+test('end_type=1 early-complete unblocks before end_type=3', async () => {
+  let push;
+  const stream = new ReadableStream({
+    start(controller) {
+      push = (chunk) => controller.enqueue(new TextEncoder().encode(chunk));
+      push(`event: SSE_ACK\ndata: ${JSON.stringify(ack)}\n\n`);
+    },
+  });
+  const started = Date.now();
+  const pending = streamCompletion(
+    { request: async () => new Response(stream, { headers: { 'content-type': 'text/event-stream' } }) },
+    completionBody({ message: 'fixture', mode: 'chat' }),
+    { timeoutMs: 5000, waitForReply: true, earlyAnswerGraceMs: 0, earlyStreamDrainMs: 0 },
+  );
+  await new Promise(resolve => setTimeout(resolve, 20));
+  push(`event: SSE_REPLY_END\ndata: ${JSON.stringify({ end_type: 1, msg_finish_attr: { brief: 'DONE' } })}\n\n`);
+  const result = await pending;
+  const elapsed = Date.now() - started;
+  assert.equal(result.accepted, true);
+  assert.equal(result.earlyComplete, 'end_type_1');
+  assert.equal(result.answer, 'DONE');
+  assert.equal(result.conversationId, conversationId);
+  assert.ok(elapsed < 1000, `early-complete should finish quickly, took ${elapsed}ms`);
+});
+
+test('end_type=1 returns immediately while background-draining until end_type=3', async () => {
+  let push;
+  const stream = new ReadableStream({
+    start(controller) {
+      push = (chunk) => controller.enqueue(new TextEncoder().encode(chunk));
+      push(`event: SSE_ACK\ndata: ${JSON.stringify(ack)}\n\n`);
+    },
+  });
+  const pending = streamCompletion(
+    { request: async () => new Response(stream, { headers: { 'content-type': 'text/event-stream' } }) },
+    completionBody({ message: 'fixture', mode: 'chat' }),
+    { timeoutMs: 5000, waitForReply: true, earlyAnswerGraceMs: 0, earlyStreamDrainMs: 2_000 },
+  );
+  await new Promise(resolve => setTimeout(resolve, 40));
+  push(`event: SSE_REPLY_END\ndata: ${JSON.stringify({ end_type: 1, msg_finish_attr: { brief: 'VISIBLE' } })}\n\n`);
+  const result = await pending;
+  assert.equal(result.earlyComplete, 'end_type_1');
   assert.equal(result.answer, 'VISIBLE');
+  assert.equal(result.streamFinished, null);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  push(`event: SSE_REPLY_END\ndata: ${JSON.stringify({ end_type: 3 })}\n\n`);
+  await result.streamDrain;
+  assert.equal(result.streamFinished, 'end_type_3');
 });

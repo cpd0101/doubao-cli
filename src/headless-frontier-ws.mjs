@@ -69,8 +69,11 @@ export function buildFrontierWsUrl(config, {
     access_key: accessKey,
     fpid: String(config.ws_product_id),
     aid: String(config.ws_app_id),
-    xsack: '1',
-    xaack: '1',
+    // Match Desktop Frontier SDK defaults (enableAutoAck:false → xsack/xaack=0).
+    // Advertising xaack=1 without sending frame-level is_ack replies leaves the
+    // server waiting after the visible answer, so the turn never settles.
+    xsack: '0',
+    xaack: '0',
     'use-olympus-account': '1',
   };
   if (identity === 'device_id') params.device_id = String(deviceId);
@@ -112,9 +115,9 @@ export function extractDispatchPayloads(buffer) {
 }
 
 /**
- * Desktop/CDP spinner follows Frontier `agent_task_status` notifies:
+ * Desktop Work Frontier `agent_task_status` notifies:
  * operation 1 upserts TASK_RUNNING / REPLYING; operation 2 clears them.
- * Clearing the last status for a conversation is when the native UI stops spinning.
+ * TASK_RUNNING often lingers after the turn; do not treat this alone as UI stop.
  */
 export function extractAgentTaskStatusEvents(buffer) {
   const ascii = Buffer.isBuffer(buffer) ? buffer.toString('utf8') : String(buffer);
@@ -156,11 +159,61 @@ export function extractAgentTaskStatusEvents(buffer) {
   return events;
 }
 
-/** Track Desktop-equivalent agent spinner state per conversation group. */
+/**
+ * Desktop/CDP spinner follows Frontier cmd 50002 `update_conv_info_notify`:
+ * conversation_info.extra.is_loading "1" → spinning, "0" → stopped.
+ * On CDP this lands ~0.8s after REPLYING clears — not on end_type=3.
+ */
+export function extractConversationLoadingEvents(buffer) {
+  const ascii = Buffer.isBuffer(buffer) ? buffer.toString('utf8') : String(buffer);
+  const events = [];
+  const marker = '"update_conv_info_notify"';
+  let from = 0;
+  while ((from = ascii.indexOf(marker, from)) !== -1) {
+    const start = ascii.lastIndexOf('{', from);
+    if (start < 0) { from += marker.length; continue; }
+    const json = sliceBalancedObject(ascii, start);
+    if (!json) { from += marker.length; continue; }
+    try {
+      const parsed = JSON.parse(json);
+      const info = parsed?.downlink_body?.update_conv_info_notify?.conversation_info
+        || parsed?.update_conv_info_notify?.conversation_info
+        || parsed?.conversation_info;
+      const conversationId = String(info?.conversation_id || '');
+      if (!conversationId) { from = start + json.length; continue; }
+      let extra = info.extra;
+      if (typeof extra === 'string') {
+        try { extra = JSON.parse(extra); } catch { from = start + json.length; continue; }
+      }
+      if (!extra || typeof extra !== 'object' || !Object.prototype.hasOwnProperty.call(extra, 'is_loading')) {
+        from = start + json.length;
+        continue;
+      }
+      const raw = extra.is_loading;
+      const isLoading = raw === true || raw === 1 || raw === '1' ? '1'
+        : raw === false || raw === 0 || raw === '0' ? '0'
+          : null;
+      if (isLoading == null) { from = start + json.length; continue; }
+      events.push({
+        cmd: 50002,
+        conversationId,
+        isLoading,
+        runningMessages: typeof extra.running_messages === 'string' ? extra.running_messages : undefined,
+      });
+    } catch {}
+    from = start + json.length;
+  }
+  return events;
+}
+
+/**
+ * Track Desktop-equivalent spinner state.
+ * Settles only when cmd 50002 sets is_loading=0 after this turn set is_loading=1.
+ */
 export function createAgentTaskStatusTracker() {
   const groups = new Map();
-  const seen = new Set();
   const settled = new Set();
+  const loadingArmed = new Set();
   const waiters = new Set();
 
   function notify() {
@@ -174,21 +227,34 @@ export function createAgentTaskStatusTracker() {
       map = new Map();
       groups.set(event.groupKey, map);
     }
-    if (event.operation === 1) {
-      map.set(event.metaId, event);
-      seen.add(event.groupKey);
-    } else if (event.operation === 2) {
-      map.delete(event.metaId);
-      seen.add(event.groupKey);
-      // Native UI clears the spinner when REPLYING is removed; TASK_RUNNING may linger.
-      if (event.metaId === 'REPLYING' || map.size === 0) settled.add(event.groupKey);
+    if (event.operation === 1) map.set(event.metaId, event);
+    else if (event.operation === 2) map.delete(event.metaId);
+    if (process.env.DOUBAO_HEADLESS_TIMING === '1') {
+      console.error(`[headless-timing] frontier_agent_status op=${event.operation} meta=${event.metaId} conversation=${event.conversationId || ''}`);
     }
-    if (seen.has(event.groupKey) && map.size === 0) settled.add(event.groupKey);
     notify();
+  }
+
+  function applyLoading(event) {
+    const id = String(event?.conversationId || '');
+    if (!id || (event.isLoading !== '0' && event.isLoading !== '1')) return;
+    if (process.env.DOUBAO_HEADLESS_TIMING === '1') {
+      console.error(`[headless-timing] frontier_is_loading conversation=${id} value=${event.isLoading}`);
+    }
+    if (event.isLoading === '1') {
+      loadingArmed.add(id);
+      settled.delete(id);
+      return notify();
+    }
+    if (loadingArmed.has(id)) {
+      settled.add(id);
+      notify();
+    }
   }
 
   function observeBuffer(buffer) {
     for (const event of extractAgentTaskStatusEvents(buffer)) apply(event);
+    for (const event of extractConversationLoadingEvents(buffer)) applyLoading(event);
   }
 
   function groupKeyFor(conversationId) {
@@ -196,7 +262,7 @@ export function createAgentTaskStatusTracker() {
   }
 
   function isSettled(conversationId) {
-    return settled.has(groupKeyFor(conversationId));
+    return settled.has(String(conversationId || ''));
   }
 
   function activeMetaIds(conversationId) {
@@ -213,7 +279,7 @@ export function createAgentTaskStatusTracker() {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         cleanup();
-        reject(Object.assign(new Error('Timed out waiting for agent_task_status to settle'), { code: 'timeout' }));
+        reject(Object.assign(new Error('Timed out waiting for conversation is_loading to clear'), { code: 'timeout' }));
       }, Math.max(1, timeoutMs));
       const onAbort = () => {
         cleanup();
@@ -223,7 +289,7 @@ export function createAgentTaskStatusTracker() {
         check() {
           if (!isSettled(id)) return;
           cleanup();
-          resolve({ conversationId: id, reason: 'agent_task_status' });
+          resolve({ conversationId: id, reason: 'is_loading' });
         },
       };
       const cleanup = () => {
@@ -237,10 +303,10 @@ export function createAgentTaskStatusTracker() {
     });
   }
 
-  return { apply, observeBuffer, isSettled, activeMetaIds, waitUntilSettled, groupKeyFor };
+  return { apply, applyLoading, observeBuffer, isSettled, activeMetaIds, waitUntilSettled, groupKeyFor };
 }
 
-/** Attach a Desktop-style agent_task_status tracker to an open Frontier socket. */
+/** Attach a Desktop-style conversation-loading tracker to an open Frontier socket. */
 export function attachAgentTaskStatusTracker(socket) {
   if (!socket || typeof socket.addEventListener !== 'function') {
     throw new TypeError('attachAgentTaskStatusTracker requires a WebSocket');
@@ -284,6 +350,109 @@ function sliceBalancedObject(text, start) {
     }
   }
   return null;
+}
+
+/**
+ * Desktop Frontier SDK keepalive: after pingIntervalMs of silence send text "hi";
+ * if no inbound within pingTimeoutMs, count a loss; after pingLossLimit losses, close.
+ * Any inbound message (including peer "hi") resets the idle timer.
+ */
+export function attachFrontierHiKeepalive(socket, {
+  pingIntervalMs = 15_000,
+  pingTimeoutMs = 4_000,
+  pingLossLimit = 2,
+  now = () => Date.now(),
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+  onClose = () => {},
+} = {}) {
+  if (!socket || typeof socket.addEventListener !== 'function' || typeof socket.send !== 'function') {
+    throw new TypeError('attachFrontierHiKeepalive requires a WebSocket-like socket');
+  }
+  let idleTimer = null;
+  let waitTimer = null;
+  let losses = 0;
+  let closed = false;
+  let waitingForPong = false;
+
+  const clearAll = () => {
+    if (idleTimer) clearTimer(idleTimer);
+    if (waitTimer) clearTimer(waitTimer);
+    idleTimer = null;
+    waitTimer = null;
+  };
+
+  const armIdle = () => {
+    if (closed) return;
+    if (idleTimer) clearTimer(idleTimer);
+    idleTimer = setTimer(() => {
+      idleTimer = null;
+      if (closed) return;
+      if (socket.readyState != null && socket.readyState !== 1) {
+        closed = true;
+        clearAll();
+        onClose('not_open');
+        return;
+      }
+      try { socket.send('hi'); } catch {
+        closed = true;
+        clearAll();
+        onClose('send_failed');
+        return;
+      }
+      waitingForPong = true;
+      waitTimer = setTimer(() => {
+        waitTimer = null;
+        waitingForPong = false;
+        losses += 1;
+        if (losses >= pingLossLimit) {
+          closed = true;
+          clearAll();
+          try { socket.close?.(); } catch {}
+          onClose('ping_loss');
+          return;
+        }
+        armIdle();
+      }, Math.max(1, pingTimeoutMs));
+    }, Math.max(1, pingIntervalMs));
+  };
+
+  const onInbound = () => {
+    if (closed) return;
+    losses = 0;
+    waitingForPong = false;
+    if (waitTimer) {
+      clearTimer(waitTimer);
+      waitTimer = null;
+    }
+    armIdle();
+  };
+
+  const onMessage = () => onInbound();
+  const onSocketClose = () => {
+    if (closed) return;
+    closed = true;
+    clearAll();
+    onClose('socket_closed');
+  };
+
+  socket.addEventListener('message', onMessage);
+  socket.addEventListener('close', onSocketClose);
+  armIdle();
+
+  return {
+    get losses() { return losses; },
+    get waitingForPong() { return waitingForPong; },
+    touch: onInbound,
+    stop() {
+      closed = true;
+      clearAll();
+      try { socket.removeEventListener('message', onMessage); } catch {}
+      try { socket.removeEventListener('close', onSocketClose); } catch {}
+    },
+    // test helper
+    _now: now,
+  };
 }
 
 export function summarizeDispatchPayload(payload) {
